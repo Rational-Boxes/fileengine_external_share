@@ -327,6 +327,10 @@ def list_for_tenant(conn, *, live_only: bool = True, creator: str = "",
         cur.execute(sql, tuple(params))
         rows = cur.fetchall()
 
+    # The caller is told when the cap bit. A console that says "here is what is
+    # reachable from outside" while silently stopping at 500 rows is worse than
+    # one that shows fewer and says so — the whole value is completeness.
+    truncated = len(rows) >= limit
     out: List[dict] = []
     n = len(_COLUMNS.split(","))
     for r in rows:
@@ -336,7 +340,7 @@ def list_for_tenant(conn, *, live_only: bool = True, creator: str = "",
         if status and link.status() != status:
             continue
         out.append({"link": link, "recipient_count": r[n],
-                    "last_activity": r[n + 1]})
+                    "last_activity": r[n + 1], "truncated": truncated})
     return out
 
 

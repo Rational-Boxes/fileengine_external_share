@@ -390,7 +390,10 @@ def list_my_links(request: Request, live: bool = True, all: bool = False,
          "last_activity": r["last_activity"],
          "resource_path": r["link"].resource_path,
          "resource_depth": r["link"].resource_depth}
-        for r in rows], "scope": "tenant"}
+        for r in rows],
+        "scope": "tenant",
+        # Surfaced, never silent: see links.list_for_tenant.
+        "truncated": bool(rows and rows[0].get("truncated"))}
 
 
 @router.post("/admin/revoke-all")

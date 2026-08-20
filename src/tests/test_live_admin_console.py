@@ -312,3 +312,31 @@ def test_revoke_all_is_idempotent(client, admin, cfg, conn):
                          headers=admin).json()
     assert first["revoked"] == 1
     assert second["revoked"] == 0
+
+
+def test_the_list_says_so_when_it_hits_its_cap(client, admin, cfg, conn, monkeypatch):
+    """Completeness is the console's whole value.
+
+    "Here is what is reachable from outside this tenant" that silently stops at
+    the row cap is worse than one showing fewer rows and saying so — an admin
+    would close the review believing they had seen everything.
+    """
+    real = links.list_for_tenant
+    monkeypatch.setattr(links, "list_for_tenant",
+                        lambda conn, **kw: real(conn, **{**kw, "limit": 2}))
+    for _ in range(3):
+        _mint(cfg, conn, created_by=OTHER)
+    r = client.get("/share/v1/links?all=true", headers=admin)
+    assert r.status_code == 200
+    assert len(r.json()["links"]) == 2
+    assert r.json()["truncated"] is True
+
+
+def test_an_uncapped_list_does_not_claim_truncation(client, admin, cfg, conn,
+                                                    monkeypatch):
+    real = links.list_for_tenant
+    monkeypatch.setattr(links, "list_for_tenant",
+                        lambda conn, **kw: real(conn, **{**kw, "limit": 5000}))
+    _mint(cfg, conn, created_by=OTHER)
+    r = client.get("/share/v1/links?all=true", headers=admin)
+    assert r.json()["truncated"] is False
