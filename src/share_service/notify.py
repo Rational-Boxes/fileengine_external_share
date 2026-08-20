@@ -48,6 +48,7 @@ DROP_RECEIVED = "drop_received"
 LINK_DEAD = "link_dead"
 OTP_SEND_FAILED = "otp_send_failed"
 FIRST_REDEMPTION = "first_redemption"
+LINK_LOCKED = "link_locked"
 
 
 class EventPublisher:

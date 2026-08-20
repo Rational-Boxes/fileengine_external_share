@@ -122,6 +122,20 @@ class Config:
         self.default_tenant = _env("SHARE_DEFAULT_TENANT", "default")
         self.otp_ttl_seconds = _int("SHARE_OTP_TTL_SECONDS", 600)
 
+        # --- abuse escalation, rung 2 (spec §8.4) --------------------------
+        # Rung 1 (per address) lives in ldap_manager, which owns the code. Rung
+        # 2 is the LINK's own budget, and exists because rung 1 is sidestepped
+        # simply by varying the address — the link is what is being attacked.
+        self.link_lockout_threshold = _int("SHARE_LINK_LOCKOUT_THRESHOLD", 15)
+        # ...or this many DISTINCT addresses each hitting rung 1, which is the
+        # spread pattern a per-address counter cannot see.
+        self.link_lockout_distinct = _int("SHARE_LINK_LOCKOUT_DISTINCT", 3)
+        self.lockout_window_minutes = _int("SHARE_LOCKOUT_WINDOW_MINUTES", 60)
+        # A lockout EXPIRES. Revoking would punish the creator permanently for
+        # someone else's behaviour, and the URL cannot be re-issued to people
+        # who already hold it.
+        self.lockout_minutes = _int("SHARE_LOCKOUT_MINUTES", 15)
+
         # --- Audit (SHARED) -----------------------------------------------
         # NOT optional here: the audit chain is the only record that an access
         # was external (spec §4.3), so auditing off == sharing off (§5.1 of the
@@ -150,7 +164,7 @@ class Config:
         self.attention_events = tuple(
             e.strip() for e in
             _env("SHARE_ATTENTION_EVENTS",
-                 "drop_received,otp_send_failed,link_dead,first_redemption").split(",")
+                 "drop_received,otp_send_failed,link_dead,first_redemption,link_locked").split(",")
             if e.strip())
 
         # --- This service's own Postgres (PRIVATE SHARE_*) -----------------
@@ -200,6 +214,16 @@ class Config:
         self.zip_max_members = _int("SHARE_ZIP_MAX_MEMBERS", 5000)
         self.zip_max_bytes = _int("SHARE_ZIP_MAX_BYTES", 2 * 1024 ** 3)
         self.retention_days = _int("SHARE_RETENTION_DAYS", 365)
+        # How often the in-process sweep runs. 0 disables it entirely — which is
+        # safe: every check is evaluated at redemption time, so a sweep that
+        # never runs costs disk and PII retention, never enforcement (§5.5).
+        self.retention_interval_s = _int("SHARE_RETENTION_INTERVAL_S", 6 * 3600)
+        # Which tenants to sweep. Named rather than discovered: this service
+        # provisions a schema on first use, so "every schema present" is not the
+        # same set as "every tenant that should be swept".
+        self.retention_tenants = tuple(
+            t.strip() for t in _env("SHARE_RETENTION_TENANTS", "").split(",")
+            if t.strip()) or None
 
         # Public URLs are built from this. Set it explicitly to move share
         # traffic to a separate download host later without invalidating links

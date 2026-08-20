@@ -29,12 +29,14 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from . import api, core_client, db, public
+from . import api, core_client, db, public, retention
 from . import metrics as _fe_metrics
 from .audit import get_emitter
 from .config import Config, get_config
@@ -115,6 +117,37 @@ def _serve_monitoring(config: Config) -> threading.Thread:
     return t
 
 
+def _serve_retention(config: Config) -> Optional[threading.Thread]:
+    """Run the retention sweep periodically in-process (spec §5.5).
+
+    A daemon thread rather than a separate worker or a cron entry, because
+    nothing about correctness depends on it: every check is evaluated at
+    redemption time, so a sweep that never runs costs disk and some PII
+    retention and can never cost enforcement. That makes it exactly the kind of
+    job that should not gain its own deployable unit.
+
+    It sleeps FIRST so a crash-looping container cannot turn a restart into a
+    delete storm, and every pass is bounded and per-link committed.
+    """
+    if config.retention_interval_s <= 0 or config.retention_days <= 0:
+        log.info("retention sweep disabled")
+        return None
+
+    def _loop() -> None:
+        while True:
+            time.sleep(config.retention_interval_s)
+            try:
+                for report in retention.sweep(config, config.retention_tenants):
+                    if report.get("purged") or report.get("skipped"):
+                        log.info("retention: %s", report)
+            except Exception:  # noqa: BLE001 - a tidy-up must never kill the process
+                log.exception("retention sweep pass failed")
+
+    t = threading.Thread(target=_loop, name="share-retention", daemon=True)
+    t.start()
+    return t
+
+
 def main() -> None:
     config = get_config()
     logging.basicConfig(
@@ -129,6 +162,7 @@ def main() -> None:
                   "redemption will refuse until the audit stream is reachable")
 
     _serve_monitoring(config)
+    _serve_retention(config)
     log.info("share_service API on %s:%d (monitoring on %s:%d)",
              config.api_host, config.api_port,
              config.monitoring_host, config.monitoring_port)

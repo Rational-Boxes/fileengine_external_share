@@ -341,15 +341,59 @@ def verify(link_uid: str, body: VerifyIn, request: Request,
         raise _deny()
 
     if not result.ok:
+        addr = client_addr(request)
+        # Rung 2: charge the LINK, not just the address (spec §8.4). Rung 1
+        # lives in ldap_manager and caps one address; varying the address walks
+        # straight past it, so the link keeps its own rolling budget.
+        conn = db.connect_for_tenant(cfg, tenant, provision=True)
+        try:
+            rung2 = links.record_failed_verification(
+                conn, link_uid, email, address_locked=result.locked,
+                threshold=cfg.link_lockout_threshold,
+                distinct_threshold=cfg.link_lockout_distinct,
+                window_minutes=cfg.lockout_window_minutes,
+                lock_minutes=cfg.lockout_minutes)
+        finally:
+            conn.close()
+
+        if rung2["locked"]:
+            # A distinct action, not a `share_link_denied` reason: this is the
+            # ADJUDICATED signal — the service has already decided a link is
+            # under attack — so the rules engine can alert on it directly
+            # rather than re-deriving the judgement from a burst of denials.
+            get_emitter(cfg).emit(
+                action="share_link_locked", outcome="denied", category="auth",
+                actor=f"share:{link_uid}", tenant=tenant, source_addr=addr,
+                request_id=link_uid,
+                detail={"link_uid": link_uid, "reason": "brute_force_lockout",
+                        "failed_attempts": rung2["attempts"],
+                        "distinct_addresses": rung2["distinct"],
+                        "locked_minutes": cfg.lockout_minutes})
+            # And tell the creator, who is the only person who can judge whether
+            # this is an attack or a recipient having a bad morning.
+            get_publisher(cfg).publish(
+                notify.LINK_LOCKED, tenant=tenant, creator=link.created_by,
+                link_uid=link_uid, file_uid=link.resource_uid,
+                detail="someone is trying codes against your link")
+
         _audit_denied(cfg, link_uid=link_uid,
                       reason="locked_out" if result.locked else "wrong_code",
-                      tenant=tenant, addr=client_addr(request), email=email)
+                      tenant=tenant, addr=addr, email=email)
         # Identical body for a wrong code and an unlisted address. `locked` is
         # reported because a recipient must be able to tell "wait" from "this
         # link is broken" -- and it is reported for unlisted addresses too,
         # since their attempts feed the same bucket.
-        return _json({"ok": False, "locked": result.locked},
+        return _json({"ok": False, "locked": result.locked or rung2["locked"]},
                      status_code=status.HTTP_401_UNAUTHORIZED)
+
+    # Someone verified, so whatever rung 2 had accumulated was noise. Without
+    # this a busy link with occasional typos walks itself into a lockout it
+    # never recovers from (spec §8.4).
+    conn = db.connect_for_tenant(cfg, tenant, provision=True)
+    try:
+        links.clear_failed_verifications(conn, link_uid)
+    finally:
+        conn.close()
 
     return _json({"ok": True, "recipient_token": result.recipient_token,
                   "expires_in": result.expires_in})

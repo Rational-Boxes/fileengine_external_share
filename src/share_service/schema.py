@@ -105,6 +105,12 @@ def _ddl(schema: str) -> list[str]:
         # current. Depth exists to answer the question the console is FOR — a
         # link on a project root is the finding, a link on one leaf file is
         # routine — so it sorts risk without needing the tree at read time.
+        # Rung 2 of the abuse escalation (spec §8.4): which ADDRESSES have
+        # tripped rung 1 inside the current window. Stored as short salted
+        # hashes, never plaintext — distinctness is the only property needed,
+        # and most of these addresses belong to people who are not recipients
+        # and never consented to be recorded here.
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS failed_addresses TEXT[];",
         f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS resource_depth INTEGER;",
         f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS resource_path TEXT;",
         f"CREATE INDEX IF NOT EXISTS share_links_resource ON {s}.share_links (resource_uid);",

@@ -344,6 +344,99 @@ def list_for_tenant(conn, *, live_only: bool = True, creator: str = "",
     return out
 
 
+def address_marker(link_uid: str, email: str) -> str:
+    """A short, link-salted hash of an address, for counting distinct ones.
+
+    Never the plaintext: rung 2 counts addresses that have TRIPPED, most of
+    which belong to people who are not recipients and never consented to appear
+    in this tenant's data. Salting with the link uid also stops the column being
+    correlated across links.
+    """
+    digest = hashlib.sha256(f"{link_uid}\x00{email.strip().lower()}".encode())
+    return digest.hexdigest()[:16]
+
+
+def record_failed_verification(conn, link_uid: str, email: str, *,
+                               address_locked: bool, threshold: int,
+                               distinct_threshold: int, window_minutes: int,
+                               lock_minutes: int) -> dict:
+    """Rung 2 (spec §8.4): a failed verification against the LINK, not one address.
+
+    Rung 1 caps attempts per address, which an attacker sidesteps simply by
+    varying the address — the link is the thing being attacked, so it needs its
+    own budget. Two ways to trip it: enough failures in total, or enough
+    DISTINCT addresses each having hit rung 1 (the spread pattern rung 1 cannot
+    see).
+
+    The window is ROLLING and the count is not a lifetime total: counts older
+    than the window are discarded, or ordinary typos accumulate over months into
+    a permanent lockout of a link nobody is attacking.
+
+    Returns ``{"locked": bool, "attempts": int, "distinct": int}``.
+    """
+    marker = address_marker(link_uid, email) if address_locked else None
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""UPDATE share_links SET
+                  -- Restart the window (and the tallies) if the old one has
+                  -- aged out; otherwise accumulate into it.
+                  failed_window_start = CASE
+                      WHEN failed_window_start IS NULL
+                        OR failed_window_start < now() - make_interval(mins => %(win)s)
+                      THEN now() ELSE failed_window_start END,
+                  failed_attempts = CASE
+                      WHEN failed_window_start IS NULL
+                        OR failed_window_start < now() - make_interval(mins => %(win)s)
+                      THEN 1 ELSE failed_attempts + 1 END,
+                  failed_addresses = CASE
+                      WHEN failed_window_start IS NULL
+                        OR failed_window_start < now() - make_interval(mins => %(win)s)
+                      THEN CASE WHEN %(marker)s::text IS NULL THEN ARRAY[]::text[]
+                                ELSE ARRAY[%(marker)s::text] END
+                      WHEN %(marker)s::text IS NULL THEN COALESCE(failed_addresses, ARRAY[]::text[])
+                      ELSE (SELECT ARRAY(SELECT DISTINCT unnest(
+                              COALESCE(failed_addresses, ARRAY[]::text[])
+                              || ARRAY[%(marker)s::text]))) END
+                WHERE link_uid = %(link)s
+            RETURNING failed_attempts,
+                      coalesce(array_length(failed_addresses, 1), 0)""",
+            {"link": link_uid, "win": window_minutes, "marker": marker})
+        row = cur.fetchone()
+        if not row:
+            conn.commit()
+            return {"locked": False, "attempts": 0, "distinct": 0}
+        attempts, distinct = int(row[0]), int(row[1])
+
+        locked = attempts >= threshold or distinct >= distinct_threshold
+        if locked:
+            # Lock, do not revoke. A lockout expires on its own; revoking would
+            # punish the creator permanently for someone else's behaviour, and
+            # the link's URL cannot be re-issued to the people already holding it.
+            cur.execute(
+                """UPDATE share_links
+                      SET locked_until = now() + make_interval(mins => %s)
+                    WHERE link_uid = %s""",
+                (lock_minutes, link_uid))
+    conn.commit()
+    return {"locked": locked, "attempts": attempts, "distinct": distinct}
+
+
+def clear_failed_verifications(conn, link_uid: str) -> None:
+    """A verified redemption clears the rolling count (spec §8.4).
+
+    Someone got in legitimately, so whatever the count had accumulated was
+    noise. Without this, a busy link with occasional typos walks itself into a
+    lockout it never recovers from.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE share_links
+                  SET failed_attempts = 0, failed_window_start = NULL,
+                      failed_addresses = NULL
+                WHERE link_uid = %s""", (link_uid,))
+    conn.commit()
+
+
 def provenance_for_files(conn, file_uids) -> dict:
     """Which of these files arrived from outside, and from whom.
 
