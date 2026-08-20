@@ -35,12 +35,12 @@ from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
-from . import core_client, db, links, preflight
+from . import core_client, db, links, preflight, snapshot as snapshot_mod
 from .audit import AuditUnavailable, get_emitter
 from .auth import Caller, get_caller
 from .config import Config
 from .ldap_roles import LdapUnavailable, UnknownUser, in_share_group
-from .schema import KIND_UPLOAD, KINDS
+from .schema import KIND_FOLDER_DOWNLOAD, KIND_UPLOAD, KINDS
 
 log = logging.getLogger("share_service.api")
 
@@ -195,18 +195,35 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
                 else status.HTTP_403_FORBIDDEN)
         raise HTTPException(code, detail)
 
-    # --- the kind must match the resource type ---------------------------
+    # --- the kind must match the resource type, and (kind 2) the snapshot --
+    # Both need a delegated client, so they share one.
+    snap = None
     try:
         with core_client.for_creator(cfg, created_by=caller.user, roles=result.roles or [],
                                      tenant=caller.tenant,
                                      source_addr=caller.source_addr) as core:
             is_dir = core.is_dir(resource_uid)
+            if not links.kind_matches_resource(body.kind, is_dir):
+                raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                    "kind does not match the resource type "
+                                    "(file for kind 0, folder for kinds 1 and 2)")
+            # A folder-download link captures its members now (spec §6.5).
+            # `follow_folder` opts into live semantics and takes no snapshot.
+            if body.kind == KIND_FOLDER_DOWNLOAD and not body.follow_folder:
+                snap = snapshot_mod.walk(core, cfg, resource_uid,
+                                         include_subdirs=body.include_subdirs)
+    except HTTPException:
+        raise
+    except snapshot_mod.SnapshotTooLarge as e:
+        # Refused here, with the numbers, so the recipient never discovers the
+        # limit mid-download (spec §6.1).
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            {"error": "folder_too_large", "message": str(e),
+                             "members": e.members, "total_bytes": e.total_bytes,
+                             "max_members": cfg.zip_max_members,
+                             "max_bytes": cfg.zip_max_bytes})
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"core unavailable: {e}")
-    if not links.kind_matches_resource(body.kind, is_dir):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST,
-                            "kind does not match the resource type "
-                            "(file for kind 0, folder for kinds 1 and 2)")
 
     # --- mint --------------------------------------------------------------
     conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
@@ -220,6 +237,10 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
             follow_folder=body.follow_folder, include_subdirs=body.include_subdirs,
             landing_prefix=body.landing_prefix, ext_allowlist=body.ext_allowlist,
             note=body.note)
+
+        if snap is not None:
+            snapshot_mod.store(conn, link.link_uid, snap)
+            link = links.get(conn, link.link_uid)
 
         # Fail-closed: creation is a grant of access, so it does not stand if it
         # cannot be recorded (spec §12).
@@ -241,6 +262,16 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
     payload = _link_json(link)
     payload["url"] = _public_url(cfg, request, link.link_uid, secret)
     payload["secret_shown_once"] = True
+    if snap is not None:
+        # The numbers the creator pastes into their own email (spec §13-R9),
+        # and the ones that make the archive size a decision rather than a
+        # surprise on a phone.
+        payload["member_count"] = snap.file_count
+        payload["archive_bytes"] = snap.archive_bytes
+        payload["worst_case_egress_bytes"] = (
+            snap.archive_bytes * link.max_uses if link.max_uses else None)
+        if snap.skipped:
+            payload["skipped"] = snap.skipped
     return payload
 
 

@@ -83,6 +83,12 @@ def check(config: Config, *, created_by: str, tenant: str, resource_uid: str,
     try:
         with core_client.for_creator(config, created_by=created_by, roles=roles,
                                      tenant=tenant, source_addr=source_addr) as core:
+            # Existence FIRST. Read-by-default means a missing uid passes the
+            # permission check, so checking permission alone fails open and a
+            # link to a deleted file would pre-flight clean (spec §6.3).
+            if not core.exists(resource_uid):
+                return PreflightResult(False, REASON_GONE, roles=roles,
+                                       detail=f"{resource_uid} no longer exists")
             if not core.check_permission(resource_uid, permission):
                 return PreflightResult(False, REASON_NO_ACCESS, roles=roles,
                                        detail=f"{created_by} lacks {permission} "

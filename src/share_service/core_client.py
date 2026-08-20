@@ -106,13 +106,33 @@ class DelegatedCore:
 
     # -- the calls M0 needs ------------------------------------------------
     def check_permission(self, resource_uid: str, permission: str = READ) -> bool:
-        """Does the creator hold ``permission`` on ``resource_uid`` *right now*?
+        """Raw permission check. **Almost never what you want** — see
+        :meth:`can_reach`.
 
-        This is the authority re-check (spec §6.3) and the creation pre-flight,
-        and it is an ordinary core RPC — which is precisely why the core needs
-        no share-specific code.
+        The core answers this from ACL rules alone, and `AclManager` ships with
+        `default_read_ = true`: a principal with no matching rule holds READ.
+        A uid that does not exist has no matching rule either, so this returns
+        **True for a resource that is not there**. Verified against the dev
+        core, not inferred.
         """
         return bool(self.client.check_permission(resource_uid, permission))
+
+    def exists(self, resource_uid: str) -> bool:
+        """Does the resource exist and is it not deleted?"""
+        return bool(self.client.entity_exists(resource_uid))
+
+    def can_reach(self, resource_uid: str, permission: str = READ) -> bool:
+        """The authority re-check as spec §6.3 actually defines it: the creator
+        holds ``permission`` **and** the resource still exists and is not
+        deleted.
+
+        Both halves are required, and the existence half is the one that is
+        easy to omit — because omitting it fails *open*: read-by-default makes
+        a missing or deleted uid look permitted, so a link to a deleted file
+        would pre-flight clean and a member that vanished would be served as a
+        zero-byte entry rather than omitted.
+        """
+        return self.exists(resource_uid) and self.check_permission(resource_uid, permission)
 
     def stat(self, resource_uid: str):
         """FileInfo for the target — used to match the link kind against the

@@ -141,6 +141,10 @@ class Config:
         )
 
         self.max_ttl_days = _int("SHARE_MAX_TTL_DAYS", 30)
+        # A redemption session, not an HTTP request, is what consumes a use
+        # (spec §6.4) -- so this is how long Range continuations and retries
+        # may keep riding one redemption_uid.
+        self.session_ttl_seconds = _int("SHARE_SESSION_TTL_SECONDS", 3600)
         self.default_ttl_days = _int("SHARE_DEFAULT_TTL_DAYS", 7)
         self.max_uses_cap = _int("SHARE_MAX_USES_CAP", 100)
         self.max_recipients = _int("SHARE_MAX_RECIPIENTS", 20)
