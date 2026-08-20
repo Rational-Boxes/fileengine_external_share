@@ -703,3 +703,39 @@ def test_content_accepts_the_redemption_as_a_query_parameter(client, cfg, roles,
         f"/share/v1/public/{link.link_uid}/content?k={secret}&redemption={uuid.uuid4()}",
         headers={"X-Tenant": TENANT})
     assert bad.status_code == 404
+
+
+def test_the_timing_signal_never_reaches_the_recipient(client, cfg, roles, tree,
+                                                       monkeypatch):
+    """Rung 0 counts a scripted attempt; it must not ANNOUNCE one.
+
+    ldap_manager returns `timing_flag` so this service can weight its own
+    counters. Forwarding it would hand an attacker a live "you look scripted"
+    readout to tune against — and would make a bot's response differ from a
+    human's typo, which is exactly the oracle §6.9 closes.
+    """
+    _root, f = tree
+    link, secret = _file_link(cfg, roles, f)
+
+    def _flagged(cfg_, **kw):
+        return otp_client.VerifyResult(ok=False, locked=False,
+                                       recipient_token=None, expires_in=0,
+                                       timing_flag="too_soon_after_send")
+
+    def _plain(cfg_, **kw):
+        return otp_client.VerifyResult(ok=False, locked=False,
+                                       recipient_token=None, expires_in=0,
+                                       timing_flag=None)
+
+    monkeypatch.setattr(otp_client, "verify_code", _flagged)
+    scripted = client.post(f"/share/v1/public/{link.link_uid}/verify",
+                           headers=_h(secret),
+                           json={"email": RECIPIENT, "code": "000000"})
+    monkeypatch.setattr(otp_client, "verify_code", _plain)
+    human = client.post(f"/share/v1/public/{link.link_uid}/verify",
+                        headers=_h(secret),
+                        json={"email": RECIPIENT, "code": "000000"})
+
+    assert scripted.status_code == human.status_code
+    assert scripted.text == human.text, "a scripted attempt must read as a typo"
+    assert "timing" not in scripted.text.lower()

@@ -189,11 +189,16 @@ def test_an_admin_sees_links_created_by_other_people(client, admin, cfg, conn):
 def test_rows_are_ordered_by_risk_not_by_date(client, admin, cfg, conn):
     """A link on a project root outranks a link on one leaf file, whatever
     order they were created in — that ordering is the console's whole point."""
+    # Scoped to this test's own creator. The tenant-wide list is CAPPED, and a
+    # dev database accumulates rows across runs — an unscoped assertion here
+    # passes until the fixtures fall off the end of the page, then fails for a
+    # reason that has nothing to do with ordering.
+    who = f"order-{uuid.uuid4().hex[:8]}@rationalboxes.com"
     tag = uuid.uuid4().hex[:8]
-    deep = _mint(cfg, conn, created_by=OTHER, depth=7,
+    deep = _mint(cfg, conn, created_by=who, depth=7,
                  path=f"/{tag}/a/b/c/d/e/leaf.txt")
-    shallow = _mint(cfg, conn, created_by=OTHER, depth=1, path=f"/{tag}")
-    r = client.get("/share/v1/links?all=true", headers=admin)
+    shallow = _mint(cfg, conn, created_by=who, depth=1, path=f"/{tag}")
+    r = client.get(f"/share/v1/links?all=true&creator={who}", headers=admin)
     order = [l["link_uid"] for l in r.json()["links"]]
     assert order.index(shallow.link_uid) < order.index(deep.link_uid)
     # ...even though the deep one was created first.
@@ -201,12 +206,13 @@ def test_rows_are_ordered_by_risk_not_by_date(client, admin, cfg, conn):
 
 
 def test_more_recipients_outranks_fewer_at_the_same_depth(client, admin, cfg, conn):
+    who = f"order-{uuid.uuid4().hex[:8]}@rationalboxes.com"
     tag = uuid.uuid4().hex[:8]
-    few = _mint(cfg, conn, created_by=OTHER, depth=4, path=f"/{tag}/x",
+    few = _mint(cfg, conn, created_by=who, depth=4, path=f"/{tag}/x",
                 recipients=["one@example.com"])
-    many = _mint(cfg, conn, created_by=OTHER, depth=4, path=f"/{tag}/y",
+    many = _mint(cfg, conn, created_by=who, depth=4, path=f"/{tag}/y",
                  recipients=[f"r{i}@example.com" for i in range(5)])
-    r = client.get("/share/v1/links?all=true", headers=admin)
+    r = client.get(f"/share/v1/links?all=true&creator={who}", headers=admin)
     order = [l["link_uid"] for l in r.json()["links"]]
     assert order.index(many.link_uid) < order.index(few.link_uid)
 
