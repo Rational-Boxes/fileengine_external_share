@@ -50,6 +50,10 @@ def _managed_files():
     return ManagedFiles
 
 
+class VersionGone(RuntimeError):
+    """The version a link was pinned to has been culled (spec §6.2)."""
+
+
 class DelegatedCore:
     """A core client bound to one creator's identity, for one tenant.
 
@@ -133,6 +137,54 @@ class DelegatedCore:
         zero-byte entry rather than omitted.
         """
         return self.exists(resource_uid) and self.check_permission(resource_uid, permission)
+
+    def current_version(self, resource_uid: str) -> str:
+        """The version name a file is at right now — what a link pins to.
+
+        One RPC: `FileInfo.version` carries it, so this does not need a full
+        revision listing.
+        """
+        return str(getattr(self.stat(resource_uid), "version", "") or "")
+
+    def get_pinned(self, resource_uid: str, version_name: str = "") -> bytes:
+        """Bytes of ``version_name``, or of the current version when empty.
+
+        **Why the name and not an offset.** ``ManagedFiles.get(uid, back=N)``
+        selects a version *positionally*, newest-first — so ``back`` is not a
+        stable handle: it shifts by one every time anyone saves the file, and
+        shifts again when versions are culled. A link that stored an offset
+        would quietly start serving a different revision than the one it was
+        minted for, which is the exact failure pinning exists to prevent.
+
+        Version names are immutable, so this resolves the name to an offset
+        *at fetch time*. A name that is no longer in the list means the version
+        was culled, and the link is dead (spec §6.2) — never "serve the closest
+        one", which would be a silent substitution.
+        """
+        if not version_name:
+            buf = self.client.get(resource_uid)
+            return buf.getvalue() if hasattr(buf, "getvalue") else bytes(buf)
+
+        names = [r.version for r in self.client.revisions(resource_uid)]
+        try:
+            offset = names.index(version_name)
+        except ValueError:
+            raise VersionGone(
+                f"{resource_uid}: version {version_name} is no longer present")
+        buf = self.client.get(resource_uid, back=offset)
+        return buf.getvalue() if hasattr(buf, "getvalue") else bytes(buf)
+
+    def has_version(self, resource_uid: str, version_name: str) -> bool:
+        """Is the pinned version still there? Used by the pre-flight so a culled
+        version surfaces to the creator as "not working" rather than as a 404
+        for the recipient."""
+        if not version_name:
+            return True
+        try:
+            return version_name in [r.version
+                                    for r in self.client.revisions(resource_uid)]
+        except Exception:  # noqa: BLE001 - unreadable means not usable
+            return False
 
     def stat(self, resource_uid: str):
         """FileInfo for the target — used to match the link kind against the

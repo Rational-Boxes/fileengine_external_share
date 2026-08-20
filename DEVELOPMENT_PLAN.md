@@ -22,6 +22,25 @@ Later milestones are in the specification's §14.
   publisher means the feature refuses to operate.
 - There is no CI in any of these repos, so the empty-core-diff criterion ships
   as `tools/check-core-untouched.sh` rather than a workflow file.
+- **A share record is `(entity uuid, version timestamp)`** — for a file link and
+  for *every member* of a folder link, so the archive reproduces the
+  **share-time state of the tree** rather than its current state. Two traps sit
+  under that:
+  - `ManagedFiles.get(uid, back=N)` selects a version **positionally**,
+    newest-first, so an offset is not a stable handle: it shifts every time
+    anyone saves the file. Only the version *name* is immutable, so links store
+    the name and resolve it to an offset at fetch time. A name that is gone
+    means culled, and the link is dead — never "serve the nearest version".
+  - `DirectoryEntry` carries **no** `version` field (only `version_count`);
+    `version` lives on `FileInfo`. Reading it off a directory listing silently
+    yields `""` for every member, which is how folder pinning can look
+    implemented while doing nothing. The walk pays one `stat` per member,
+    bounded by `share.zip_max_members`, once at creation.
+  - Consequence worth knowing: because member *sizes* are captured at snapshot
+    time, serving content from the head would have produced an
+    `ArchiveLengthMismatch` on any member edit — i.e. folder links breaking
+    whenever anyone touched a file. Pinning makes the declared length and the
+    served bytes consistent by construction.
 
 Companion: [`design_documents/OUTSIDE_SHARE_LINKS.md`](design_documents/OUTSIDE_SHARE_LINKS.md)
 — the specification; section references below are to it.

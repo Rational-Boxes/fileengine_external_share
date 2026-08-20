@@ -44,6 +44,7 @@ REASON_NO_ACCESS = "creator_no_longer_has_access"
 REASON_GONE = "resource_gone"
 REASON_LDAP = "directory_unavailable"
 REASON_UNKNOWN_CREATOR = "creator_not_in_directory"
+REASON_VERSION_GONE = "pinned_version_culled"
 
 
 @dataclass
@@ -58,7 +59,7 @@ class PreflightResult:
 
 
 def check(config: Config, *, created_by: str, tenant: str, resource_uid: str,
-          permission: str = core_client.READ,
+          permission: str = core_client.READ, pinned_version: str = "",
           source_addr: str = "") -> PreflightResult:
     """Would a redemption of this link succeed right now?
 
@@ -93,6 +94,14 @@ def check(config: Config, *, created_by: str, tenant: str, resource_uid: str,
                 return PreflightResult(False, REASON_NO_ACCESS, roles=roles,
                                        detail=f"{created_by} lacks {permission} "
                                               f"on {resource_uid}")
+            # A link records (entity uuid, version timestamp). If that version
+            # has been culled the link is dead -- and the creator should learn
+            # it from their own Share tab, not from a recipient reporting a 404
+            # (spec §6.2).
+            if pinned_version and not core.has_version(resource_uid, pinned_version):
+                return PreflightResult(False, REASON_VERSION_GONE, roles=roles,
+                                       detail=f"version {pinned_version} of "
+                                              f"{resource_uid} has been culled")
     except Exception as e:  # noqa: BLE001 - a core failure must deny, not leak
         log.warning("preflight denied: core check failed for %s on %s: %s",
                     created_by, resource_uid, e)
@@ -111,4 +120,7 @@ def creator_message(result: PreflightResult) -> str:
         REASON_LDAP: "The directory is unavailable, so your permissions cannot "
                      "be confirmed right now. Try again shortly.",
         REASON_UNKNOWN_CREATOR: "The link's creator is no longer in the directory.",
+        REASON_VERSION_GONE: "The version this link shares has been purged, so "
+                             "the link no longer works. Share the file again to "
+                             "send the current version.",
     }.get(result.reason, "")

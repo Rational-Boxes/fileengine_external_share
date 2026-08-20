@@ -137,8 +137,21 @@ def walk(core: DelegatedCore, cfg: Config, root_uid: str, *,
                 continue
 
             size = int(getattr(entry, "size", 0) or 0)
+            # THE VERSION TIMESTAMP, captured now, alongside the entity UUID --
+            # together they are what the link actually shares (spec §6.5).
+            #
+            # `DirectoryEntry` does NOT carry a version (only `version_count`);
+            # `version` lives on `FileInfo`. Reading it off the listing yields ""
+            # every time, which is how folder members silently followed the head
+            # instead of being pinned. One `stat` per member is the cost, bounded
+            # by share.zip_max_members and paid once at creation.
+            try:
+                version = core.current_version(entry.uid)
+            except Exception as e:  # noqa: BLE001 - unreadable member is skipped
+                skipped.append(f"{raw_path}: version unreadable ({e})")
+                continue
             members.append(Member(path, size, member_uid=entry.uid,
-                                  version_name=str(getattr(entry, "version", "") or "")))
+                                  version_name=version))
             total_bytes += size
 
             if cfg.zip_max_members and len(members) > cfg.zip_max_members:

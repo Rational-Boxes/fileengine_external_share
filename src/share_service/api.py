@@ -40,7 +40,7 @@ from .audit import AuditUnavailable, get_emitter
 from .auth import Caller, get_caller
 from .config import Config
 from .ldap_roles import LdapUnavailable, UnknownUser, in_share_group
-from .schema import KIND_FOLDER_DOWNLOAD, KIND_UPLOAD, KINDS
+from .schema import KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD, KIND_UPLOAD, KINDS
 
 log = logging.getLogger("share_service.api")
 
@@ -198,6 +198,7 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
     # --- the kind must match the resource type, and (kind 2) the snapshot --
     # Both need a delegated client, so they share one.
     snap = None
+    pinned_version = None
     try:
         with core_client.for_creator(cfg, created_by=caller.user, roles=result.roles or [],
                                      tenant=caller.tenant,
@@ -207,6 +208,17 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
                 raise HTTPException(status.HTTP_400_BAD_REQUEST,
                                     "kind does not match the resource type "
                                     "(file for kind 0, folder for kinds 1 and 2)")
+            # A file link records the ENTITY UUID AND THE VERSION TIMESTAMP, so
+            # it keeps serving what it was minted for. Unpinned is the explicit
+            # opt-in: without this a document shared for review in March
+            # silently exposes whatever it becomes in September (spec §6.2).
+            if body.kind == KIND_FILE_DOWNLOAD and not body.follow_latest:
+                pinned_version = core.current_version(resource_uid)
+                if not pinned_version:
+                    raise HTTPException(
+                        status.HTTP_400_BAD_REQUEST,
+                        "this file has no saved version yet, so there is "
+                        "nothing to share")
             # A folder-download link captures its members now (spec §6.5).
             # `follow_folder` opts into live semantics and takes no snapshot.
             if body.kind == KIND_FOLDER_DOWNLOAD and not body.follow_folder:
@@ -234,6 +246,7 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
             max_uses=body.max_uses, max_uses_per_recipient=body.max_uses_per_recipient,
             max_bytes=body.max_bytes, max_file_bytes=body.max_file_bytes,
             max_files=body.max_files or (cfg.upload_max_files if body.kind == KIND_UPLOAD else 0),
+            pinned_version=pinned_version,
             follow_folder=body.follow_folder, include_subdirs=body.include_subdirs,
             landing_prefix=body.landing_prefix, ext_allowlist=body.ext_allowlist,
             note=body.note)
@@ -322,6 +335,7 @@ def get_link(link_uid: str, request: Request,
         permission = core_client.WRITE if link.kind == KIND_UPLOAD else core_client.READ
         result = preflight.check(cfg, created_by=link.created_by, tenant=caller.tenant,
                                  resource_uid=link.resource_uid, permission=permission,
+                                 pinned_version=link.pinned_version or "",
                                  source_addr=caller.source_addr)
         if not result:
             payload["status"] = "not_working"

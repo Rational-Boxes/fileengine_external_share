@@ -333,3 +333,122 @@ def test_the_public_router_never_reads_a_bearer_token(client, cfg, roles, tree):
     r = client.get(f"/share/v1/public/{link.link_uid}",
                    headers={"X-Tenant": TENANT, "Authorization": "Bearer x"})
     assert r.status_code == 404          # ...and cannot substitute for the secret
+
+
+# --- 6. version pinning: the link shares (entity uuid, version timestamp) ---
+
+def _file_link(cfg, roles, file_uid, follow_latest=False):
+    """A kind=0 link through the real creation path, so pinning is exercised
+    where it actually happens."""
+    from share_service import core_client as cc
+    conn = db.connect_for_tenant(cfg, TENANT, provision=True)
+    try:
+        pinned = None
+        if not follow_latest:
+            with cc.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+                pinned = core.current_version(file_uid)
+        link, secret = links.create(
+            conn, kind=0, resource_uid=file_uid, created_by=USER,
+            expires_at=links.clamp_expiry(cfg, None, 1),
+            recipients=[RECIPIENT], max_uses=9, pinned_version=pinned)
+        return link, secret
+    finally:
+        conn.close()
+
+
+def _fetch(client, link, secret, verified):
+    r = client.post(f"/share/v1/public/{link.link_uid}/session",
+                    headers=_h(secret, **{"X-Recipient-Token": verified}),
+                    json={"email": RECIPIENT})
+    assert r.status_code == 200, r.text
+    return client.get(f"/share/v1/public/{link.link_uid}/content",
+                      headers=_h(secret, **{"X-Redemption-Uid":
+                                            r.json()["redemption_uid"]}))
+
+
+def test_a_pinned_file_link_does_not_follow_later_edits(client, cfg, roles, tree,
+                                                        verified):
+    """The property §6.2 exists for: a document shared for review in March must
+    not silently expose whatever it becomes in September."""
+    root, doc = tree
+    link, secret = _file_link(cfg, roles, doc)
+    assert link.pinned_version, "creation must record the version timestamp"
+
+    assert _fetch(client, link, secret, verified).content == b"the payload"
+
+    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+        core.client.put(doc, b"RENEGOTIATED TERMS -- much later, much longer")
+
+    # The recipient still receives what the link was minted for.
+    assert _fetch(client, link, secret, verified).content == b"the payload"
+
+
+def test_follow_latest_is_the_explicit_opt_in(client, cfg, roles, tree, verified):
+    root, doc = tree
+    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+        core.client.put(doc, b"first")
+    link, secret = _file_link(cfg, roles, doc, follow_latest=True)
+    assert link.pinned_version is None
+
+    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+        core.client.put(doc, b"second, and this link should follow it")
+    assert _fetch(client, link, secret, verified).content == \
+        b"second, and this link should follow it"
+
+
+def test_pinning_survives_several_intervening_versions(client, cfg, roles, tree,
+                                                       verified):
+    """`get(back=N)` selects positionally, so an offset shifts every time anyone
+    saves. Storing the version NAME is what makes the pin stable."""
+    root, doc = tree
+    link, secret = _file_link(cfg, roles, doc)
+    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+        for i in range(4):
+            core.client.put(doc, f"revision {i}".encode())
+    assert _fetch(client, link, secret, verified).content == b"the payload"
+
+
+def test_a_culled_pinned_version_kills_the_link(client, cfg, roles, tree, verified):
+    """Never a silent substitution: if the pinned version is gone the link is
+    dead, uniformly (spec §6.2)."""
+    root, doc = tree
+    link, secret = _file_link(cfg, roles, doc)
+
+    conn = db.connect_for_tenant(cfg, TENANT)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE share_links SET pinned_version = %s WHERE link_uid = %s",
+                        ("19700101_000000.000", link.link_uid))
+        conn.commit()
+        link = links.get(conn, link.link_uid)
+    finally:
+        conn.close()
+
+    r = client.post(f"/share/v1/public/{link.link_uid}/session",
+                    headers=_h(secret, **{"X-Recipient-Token": verified}),
+                    json={"email": RECIPIENT})
+    # The pre-flight catches it at session open, before any budget moves.
+    assert r.status_code == 404
+
+
+def test_folder_members_pin_their_version_too(client, cfg, roles, tree, verified):
+    """`DirectoryEntry` carries no version, so reading it off the listing pinned
+    nothing — members silently followed the head."""
+    root, doc = tree
+    link, secret = _mint(cfg, roles, root)
+
+    conn = db.connect_for_tenant(cfg, TENANT)
+    try:
+        stored = snapshot_mod.load(conn, link.link_uid)
+    finally:
+        conn.close()
+    assert all(m.version_name for m in stored if not m.is_dir), \
+        "every member must record a version timestamp"
+
+    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+        core.client.put(doc, b"changed after the snapshot was taken")
+
+    r = _fetch(client, link, secret, verified)
+    assert r.status_code == 200
+    zf = zipfile.ZipFile(io.BytesIO(r.content))
+    assert zf.read("doc.txt") == b"the payload"

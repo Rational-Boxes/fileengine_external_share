@@ -64,7 +64,7 @@ from . import snapshot as snapshot_mod
 from .audit import AuditUnavailable, get_emitter
 from .auth import client_addr
 from .config import Config
-from .core_client import READ, WRITE, for_creator
+from .core_client import READ, WRITE, VersionGone, for_creator
 from .ldap_roles import LdapUnavailable, UnknownUser, resolve_share_roles
 from .schema import KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD, KIND_UPLOAD
 
@@ -367,7 +367,9 @@ def open_session(link_uid: str, body: SessionIn, request: Request,
         permission = WRITE if link.kind == KIND_UPLOAD else READ
         result = preflight.check(cfg, created_by=link.created_by, tenant=tenant,
                                  resource_uid=link.resource_uid,
-                                 permission=permission, source_addr=addr)
+                                 permission=permission,
+                                 pinned_version=link.pinned_version or "",
+                                 source_addr=addr)
         if not result:
             _audit_denied(cfg, link_uid=link_uid, reason=result.reason,
                           tenant=tenant, addr=addr, email=email)
@@ -491,11 +493,20 @@ def content(link_uid: str, request: Request, k: Optional[str] = None,
             def stream_zip():
                 with core_ctx as core:
                     def open_member(m):
-                        buf = core.client.get(m.member_uid)
-                        raw = buf.getvalue() if hasattr(buf, "getvalue") else buf
-                        yield raw
+                        # (member_uid, version_name) -- the entity and the exact
+                        # revision the snapshot recorded, not whatever the file
+                        # has become since (spec §6.5).
+                        yield core.get_pinned(m.member_uid, m.version_name)
                     try:
                         yield from archive.stream(members, open_member)
+                    except VersionGone:
+                        # A pinned member was culled mid-stream. The declared
+                        # length is already committed, so this is the same
+                        # situation as a size mismatch: abort rather than serve
+                        # a short body (spec §6.5).
+                        log.error("pinned member version gone on %s — aborting",
+                                  link_uid)
+                        raise
                     except archive.ArchiveLengthMismatch:
                         # The declared length is already on the wire. Abort
                         # rather than send a short body: a truncated archive
@@ -512,10 +523,18 @@ def content(link_uid: str, request: Request, k: Optional[str] = None,
                          "Accept-Ranges": "none",
                          "Content-Disposition": 'attachment; filename="download.zip"'})
 
-        # kind 0 — a single file at its pinned version.
+        # kind 0 — the single file, at the version the link recorded.
         with core_ctx as core:
-            buf = core.client.get(link.resource_uid)
-            raw = buf.getvalue() if hasattr(buf, "getvalue") else bytes(buf)
+            try:
+                raw = core.get_pinned(link.resource_uid, link.pinned_version or "")
+            except VersionGone:
+                # The pinned version was culled: the link is dead, uniformly
+                # (spec §6.2). Never fall back to the current version -- that
+                # is the silent substitution pinning exists to prevent.
+                _audit_denied(cfg, link_uid=link_uid, reason="version_gone",
+                              tenant=tenant, addr=client_addr(request),
+                              email=session["verified_email"])
+                raise _deny()
         return Response(content=raw, media_type="application/octet-stream",
                         headers={"Content-Length": str(len(raw))})
     finally:
