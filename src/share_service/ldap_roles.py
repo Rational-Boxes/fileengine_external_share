@@ -138,5 +138,25 @@ def resolve_share_roles(cfg: Config, username: str) -> List[str]:
 def in_share_group(cfg: Config, username: str) -> bool:
     """The per-user half of the creation gate (spec §8.1): membership of the
     `share_external` group. Asked of the *caller*, who is present and
-    authenticated — not of an absent creator."""
-    return cfg.ldap_group in resolve_raw_roles(cfg, username)
+    authenticated — not of an absent creator.
+
+    Administrators pass without being in the group: an administrator is expected
+    to have every feature available, and having to add oneself to a group to see
+    a tab is exactly the kind of invisible gate that reads as a broken build.
+
+    **This is a policy gate, not a security one, and the distinction is the
+    whole reason admitting admins here is safe.** What stops an admin's link
+    becoming admin reach is `resolve_share_roles`, which STRIPS admin roles from
+    the identity used at redemption (spec §4.2) — and that stripping is applied
+    at the redemption end, independently of who was allowed to mint. So an
+    admin's link redeems with their ORDINARY roles, exactly like anyone else's.
+
+    The visible consequence, which is correct and worth knowing: an admin who
+    can reach a resource *only* through the admin bypass will have the link
+    refused at creation by the pre-flight, because the stripped identity cannot
+    read it. That is the design working, not a bug — see `creator_message`.
+    """
+    roles = {r.lower() for r in resolve_raw_roles(cfg, username)}
+    if roles & {r.lower() for r in cfg.admin_roles}:
+        return True
+    return cfg.ldap_group.lower() in roles

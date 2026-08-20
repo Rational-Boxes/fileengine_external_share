@@ -172,9 +172,16 @@ def check_many(config: Config, *, created_by: str, tenant: str,
 def creator_message(result: PreflightResult) -> str:
     """A sentence the creator can act on. Not for outside callers."""
     return {
-        REASON_NO_ACCESS: "You no longer have access to this item, so the link "
-                          "would not work. Ask for access, or share something "
-                          "you can still open.",
+        # NB an ADMINISTRATOR can hit this while plainly able to open the item
+        # in the browser, which reads as nonsense unless the reason is stated:
+        # a share link deliberately runs on ordinary permissions, never on the
+        # administrator override (spec §4.2), or every admin-minted link would
+        # carry admin reach to whoever redeemed it.
+        REASON_NO_ACCESS: "This link would not work: sharing uses your ordinary "
+                          "permissions, never an administrator override. If you "
+                          "can only open this item as an administrator, grant "
+                          "yourself normal access to it first, or share "
+                          "something you can already open without it.",
         REASON_GONE: "This item is no longer available.",
         REASON_LDAP: "The directory is unavailable, so your permissions cannot "
                      "be confirmed right now. Try again shortly.",

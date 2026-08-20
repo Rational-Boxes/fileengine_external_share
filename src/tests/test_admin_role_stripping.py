@@ -106,3 +106,49 @@ def test_redemption_uid_travels_as_a_claim(cfg):
                              redemption_uid="r-123")
     assert with_uid._claims() == ["share.redemption_uid=r-123"]
     assert DelegatedCore(cfg, user="alice", roles=[], tenant="default")._claims() == []
+
+
+# --- administrators may MINT, but never REDEEM with admin reach -----------
+
+def test_an_administrator_passes_the_share_gate_without_the_group(cfg, monkeypatch):
+    """Administrators get every feature; needing to add yourself to a group to
+    see a tab is an invisible gate that reads as a broken build."""
+    from share_service import ldap_roles
+    monkeypatch.setattr(ldap_roles, "resolve_raw_roles",
+                        lambda c, u: ["users", "administrators"])
+    assert ldap_roles.in_share_group(cfg, "an-admin") is True
+
+
+def test_an_ordinary_user_still_needs_the_group(cfg, monkeypatch):
+    """Guard on the guard: admitting admins must not open the gate generally."""
+    from share_service import ldap_roles
+    monkeypatch.setattr(ldap_roles, "resolve_raw_roles",
+                        lambda c, u: ["users", "engineering"])
+    assert ldap_roles.in_share_group(cfg, "someone") is False
+
+
+def test_the_group_still_admits_a_non_admin(cfg, monkeypatch):
+    from share_service import ldap_roles
+    monkeypatch.setattr(ldap_roles, "resolve_raw_roles",
+                        lambda c, u: ["users", "share_external"])
+    assert ldap_roles.in_share_group(cfg, "someone") is True
+
+
+def test_admitting_admins_to_the_gate_does_not_leak_admin_roles_downstream(cfg, monkeypatch):
+    """THE property that makes the above safe.
+
+    Whether an admin may MINT is a policy question. What stops their link
+    carrying admin reach is the stripping applied at REDEMPTION — a separate
+    mechanism, applied at the other end. If these two ever became one decision,
+    admitting admins to the gate would hand admin reach to every recipient.
+    """
+    from share_service import ldap_roles
+    monkeypatch.setattr(ldap_roles, "resolve_raw_roles",
+                        lambda c, u: ["users", "administrators", "tenant_admin",
+                                      "engineering"])
+    assert ldap_roles.in_share_group(cfg, "an-admin") is True
+    delegated = ldap_roles.resolve_share_roles(cfg, "an-admin")
+    assert "administrators" not in delegated
+    assert "tenant_admin" not in delegated
+    assert "system_admin" not in delegated
+    assert "engineering" in delegated, "ordinary roles must survive"
