@@ -55,9 +55,13 @@ if [[ "$current" != "$BASE" ]]; then
         echo "FAIL: file_engine_core branch '$current' differs from '$BASE':" >&2
         echo "$diff_stat" >&2
         echo >&2
-        echo "share_service must not require a core change. If one is genuinely" >&2
-        echo "needed, that is the signal to re-open spec §4 deliberately rather" >&2
-        echo "than to make the change quietly." >&2
+        echo >&2
+        echo "This check can see THAT the core differs, not WHY. Judge it:" >&2
+        echo "  * If share_service needs that change to work, the architecture" >&2
+        echo "    has slipped -- re-open spec §4 deliberately rather than" >&2
+        echo "    letting a core dependency appear quietly." >&2
+        echo "  * If the core is simply on an unrelated branch, this is noise:" >&2
+        echo "    re-run with CORE_BASE set, or check out the core's base first." >&2
         fail=1
     fi
 fi

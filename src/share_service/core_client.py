@@ -146,33 +146,47 @@ class DelegatedCore:
         """
         return str(getattr(self.stat(resource_uid), "version", "") or "")
 
-    def get_pinned(self, resource_uid: str, version_name: str = "") -> bytes:
-        """Bytes of ``version_name``, or of the current version when empty.
+    def stream_pinned(self, resource_uid: str, version_name: str = ""):
+        """Yield ``version_name``'s bytes in bounded chunks, or the current
+        version's when empty. **The way share content should be read.**
 
-        **Why the name and not an offset.** ``ManagedFiles.get(uid, back=N)``
-        selects a version *positionally*, newest-first — so ``back`` is not a
-        stable handle: it shifts by one every time anyone saves the file, and
-        shifts again when versions are culled. A link that stored an offset
-        would quietly start serving a different revision than the one it was
-        minted for, which is the exact failure pinning exists to prevent.
+        The version travels on the request, so the core serves exactly that
+        revision straight from storage without either side holding the file.
+        Two things this replaces:
 
-        Version names are immutable, so this resolves the name to an offset
-        *at fetch time*. A name that is no longer in the list means the version
-        was culled, and the link is dead (spec §6.2) — never "serve the closest
-        one", which would be a silent substitution.
+        * ``get()``, which accumulates the whole file into a ``BytesIO`` — fine
+          for a note, wrong for a 4 GiB model, and the reason a folder archive
+          used to buffer one member at a time.
+        * ``get(back=N)``, which selects a version *positionally*, newest-first.
+          ``back`` is not a stable handle: it shifts by one every time anyone
+          saves the file. A link resolving a pin that way would quietly start
+          serving a different revision than it was minted for — the exact
+          failure pinning exists to prevent. Version names are immutable, so
+          the name is what travels.
+
+        A culled version raises :class:`VersionGone`: the link is dead (spec
+        §6.2), never "serve the nearest revision".
         """
-        if not version_name:
-            buf = self.client.get(resource_uid)
-            return buf.getvalue() if hasattr(buf, "getvalue") else bytes(buf)
-
-        names = [r.version for r in self.client.revisions(resource_uid)]
+        from fileengine.exceptions import NotFoundError  # noqa: PLC0415
         try:
-            offset = names.index(version_name)
-        except ValueError:
-            raise VersionGone(
-                f"{resource_uid}: version {version_name} is no longer present")
-        buf = self.client.get(resource_uid, back=offset)
-        return buf.getvalue() if hasattr(buf, "getvalue") else bytes(buf)
+            for chunk in self.client.get_stream(resource_uid, version=version_name or ""):
+                if chunk:
+                    yield chunk
+        except NotFoundError as e:
+            if version_name:
+                raise VersionGone(
+                    f"{resource_uid}: version {version_name} is no longer "
+                    f"present") from e
+            raise
+
+    def get_pinned(self, resource_uid: str, version_name: str = "") -> bytes:
+        """The whole of :meth:`stream_pinned`, assembled.
+
+        Kept for callers that genuinely need one buffer. Anything writing to a
+        socket should use ``stream_pinned`` instead — this one's memory cost
+        scales with the largest file anyone shares.
+        """
+        return b"".join(self.stream_pinned(resource_uid, version_name))
 
     def has_version(self, resource_uid: str, version_name: str) -> bool:
         """Is the pinned version still there? Used by the pre-flight so a culled

@@ -35,6 +35,14 @@ tables. The outside origin is recorded in metadata and audit instead (§6.8).
 **The extension allowlist is a convenience, never a security control.** It is
 matched on the claimed name only; content type is not trusted and nothing is
 executed.
+
+**Nothing holds the whole file.** The request body is spooled to a temporary
+file as it arrives (with the size cap enforced during the write, so an oversized
+body is refused at the cap rather than after it has all landed), then streamed
+from there into the core. The spool exists because the HTTP body arrives on an
+async iterator while the gRPC upload is synchronous; bridging the two with a
+queue and a thread would be the alternative, and is more machinery than a
+bounded temp file deserves. Peak memory is one chunk either way.
 """
 from __future__ import annotations
 
@@ -49,11 +57,9 @@ from .core_client import DelegatedCore
 
 log = logging.getLogger("share_service.drops")
 
-# The Python core client sends a file in ONE PutFile message (it does not expose
-# StreamFileUpload), and its channel is configured for 64 MiB. So that is the
-# real per-file ceiling regardless of what a link's budget says. Lifting it means
-# exposing the streaming RPC in python_interface, not raising a number here.
-GRPC_MESSAGE_CEILING = 64 * 1024 * 1024
+# Chunk read from the spool and handed to the core. The client re-splits
+# anything larger anyway; matching its bound keeps one size in play.
+UPLOAD_CHUNK = 4 * 1024 * 1024
 
 _UNSAFE_NAME = re.compile(r"[\x00-\x1f/\\]")
 
@@ -100,9 +106,14 @@ def extension_allowed(name: str, allowlist: Optional[List[str]]) -> bool:
 
 
 def effective_file_cap(cfg: Config, link_max_file_bytes: int) -> int:
-    caps = [c for c in (link_max_file_bytes, cfg.upload_max_file_bytes,
-                        GRPC_MESSAGE_CEILING) if c]
-    return min(caps) if caps else GRPC_MESSAGE_CEILING
+    """The per-file limit, which is now purely a *policy* number.
+
+    It used to be floored by the gRPC message ceiling, because the client sent a
+    file in one message. With ``put_stream`` the transport imposes no ceiling of
+    its own, so what remains is what the deployment and the link actually chose.
+    """
+    caps = [c for c in (link_max_file_bytes, cfg.upload_max_file_bytes) if c]
+    return min(caps) if caps else 0
 
 
 # --- budget ---------------------------------------------------------------
@@ -192,8 +203,9 @@ def unique_name(core: DelegatedCore, folder_uid: str, name: str) -> str:
 
 # --- the drop -------------------------------------------------------------
 
-def store(core: DelegatedCore, *, folder_uid: str, name: str, payload: bytes,
-          landing_prefix: Optional[str], provenance: dict) -> DropResult:
+def store(core: DelegatedCore, *, folder_uid: str, name: str, chunks,
+          size_bytes: int, landing_prefix: Optional[str],
+          provenance: dict) -> DropResult:
     """Create the file as the creator and stamp its origin.
 
     Provenance is written as **version** metadata on the dropped version and
@@ -210,7 +222,10 @@ def store(core: DelegatedCore, *, folder_uid: str, name: str, payload: bytes,
 
     file_uid = core.client.touch(target, stored_name)
     file_uid = getattr(file_uid, "uid", file_uid)
-    core.client.put(file_uid, payload)
+    # Streamed, not buffered: the core pulls chunks straight into its storage
+    # writer, so a large drop costs one chunk of memory here rather than its
+    # whole size -- per concurrent sender.
+    core.client.put_stream(file_uid, chunks, chunk_size=UPLOAD_CHUNK)
 
     version = ""
     try:
@@ -233,4 +248,4 @@ def store(core: DelegatedCore, *, folder_uid: str, name: str, payload: bytes,
             pass
 
     return DropResult(file_uid=str(file_uid), stored_name=stored_name,
-                      size_bytes=len(payload))
+                      size_bytes=size_bytes)

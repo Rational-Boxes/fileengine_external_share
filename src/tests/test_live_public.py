@@ -623,3 +623,56 @@ def test_the_landing_prefix_quarantines_drops(client, cfg, roles, tree, verified
         inbox = next(e for e in core.client.dir(root)
                      if e.name == "inbox" and e.is_container)
         assert "note.txt" in {e.name for e in core.client.dir(inbox.uid)}
+
+
+# --- 8. streaming: nothing holds a whole file -----------------------------
+
+def test_a_drop_larger_than_the_old_unary_ceiling_now_works(client, cfg, roles,
+                                                            tree, verified):
+    """80 MiB: impossible when the drop path buffered and sent one PutFile
+    message (64 MiB channel cap), routine once it spools and streams."""
+    root, _ = tree
+    link, secret = _drop_link(cfg, roles, root, max_files=2,
+                              max_file_bytes=200 * 1024 * 1024)
+    redemption = _open(client, link, secret, verified)
+
+    body = b"\xa5" * (80 * 1024 * 1024)
+    r = _drop(client, link, secret, redemption, "large.bin", body)
+    assert r.status_code == 201, r.text
+    assert r.json()["size_bytes"] == len(body)
+
+    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+        entry = next(e for e in core.client.dir(root) if e.name == "large.bin")
+        assert core.client.stat(entry.uid).size == len(body)
+        # Read it back the same way -- streamed, never assembled.
+        seen = sum(len(c) for c in core.stream_pinned(entry.uid))
+        assert seen == len(body)
+
+
+def test_a_file_link_streams_rather_than_materialising(client, cfg, roles, tree,
+                                                       verified):
+    root, doc = tree
+    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+        big = b"z" * (12 * 1024 * 1024)
+        core.client.put_stream(doc, [big])
+    link, secret = _file_link(cfg, roles, doc)
+
+    r = _fetch(client, link, secret, verified)
+    assert r.status_code == 200
+    assert int(r.headers["content-length"]) == len(r.content) == 12 * 1024 * 1024
+
+
+def test_folder_members_stream_into_the_archive(client, cfg, roles, tree, verified):
+    """The zip framer consumes an iterable per member, so peak memory is one
+    chunk rather than the largest file in the folder."""
+    root, doc = tree
+    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+        core.client.put_stream(doc, [b"m" * (9 * 1024 * 1024)])
+    link, secret = _mint(cfg, roles, root)
+
+    r = _fetch(client, link, secret, verified)
+    assert r.status_code == 200
+    assert int(r.headers["content-length"]) == len(r.content)
+    zf = zipfile.ZipFile(io.BytesIO(r.content))
+    assert zf.testzip() is None
+    assert len(zf.read("doc.txt")) == 9 * 1024 * 1024

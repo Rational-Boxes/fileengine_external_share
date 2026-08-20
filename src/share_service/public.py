@@ -52,6 +52,7 @@ one is individually easy to erode:
 from __future__ import annotations
 
 import logging
+import tempfile
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
@@ -77,8 +78,7 @@ _NOT_FOUND = {"error": "not_found"}
 
 # Starlette renamed this constant; support both so the module works either side
 # of the rename rather than emitting a deprecation warning on a hot path.
-_HTTP_413 = getattr(status, "HTTP_413_CONTENT_TOO_LARGE",
-                    status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
+_HTTP_413 = getattr(status, "HTTP_413_CONTENT_TOO_LARGE", 413)
 
 # Set on every response from this router, including errors (spec §8.3).
 _HARDENING = {
@@ -513,37 +513,54 @@ async def drop_file(link_uid: str, request: Request, k: Optional[str] = None,
         if budget is not None:
             cap = min(cap, budget)
 
-        # Read with the cap enforced as we go, so a hostile body is refused at
-        # the cap rather than after it has all arrived.
-        payload = bytearray()
-        async for chunk in request.stream():
-            payload.extend(chunk)
-            if len(payload) > cap:
-                _audit_denied(cfg, link_uid=link_uid, reason="file_too_large",
-                              tenant=tenant, addr=addr,
-                              email=session["verified_email"])
-                raise HTTPException(_HTTP_413,
-                                    {"error": "file_too_large", "max_bytes": cap})
-        if not payload:
-            raise HTTPException(status.HTTP_400_BAD_REQUEST, {"error": "empty_file"})
+        # Spool to disk with the cap enforced as we go, so a hostile body is
+        # refused AT the cap rather than after it has all arrived -- and so peak
+        # memory is one chunk rather than the whole upload, per concurrent
+        # sender. The spool exists because the body arrives on an async iterator
+        # while the gRPC upload is synchronous (see drops.py).
+        received = 0
+        with tempfile.SpooledTemporaryFile(max_size=1024 * 1024) as spool:
+            async for chunk in request.stream():
+                received += len(chunk)
+                if cap and received > cap:
+                    _audit_denied(cfg, link_uid=link_uid, reason="file_too_large",
+                                  tenant=tenant, addr=addr,
+                                  email=session["verified_email"])
+                    raise HTTPException(_HTTP_413,
+                                        {"error": "file_too_large",
+                                         "max_bytes": cap})
+                spool.write(chunk)
+            if not received:
+                raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                    {"error": "empty_file"})
+            spool.seek(0)
 
-        roles = _live_creator_roles(cfg, link)
-        provenance = {
-            "share.link_uid": link_uid,
-            "share.redemption_uid": session["redemption_uid"],
-            "share.source_addr": addr,
-            "share.verified_email": session["verified_email"],
-            # Sender-typed free text. UNTRUSTED -- the UI must render it as such
-            # (spec §6.8); the verified address beside it is the trustworthy half.
-            "share.claimed_name": (x_claimed_name or "")[:200] or None,
-        }
-        with for_creator(cfg, created_by=link.created_by, roles=roles,
-                         tenant=tenant, source_addr=addr,
-                         redemption_uid=session["redemption_uid"]) as core:
-            result = drops.store(core, folder_uid=link.resource_uid, name=name,
-                                 payload=bytes(payload),
-                                 landing_prefix=link.landing_prefix,
-                                 provenance=provenance)
+            roles = _live_creator_roles(cfg, link)
+            provenance = {
+                "share.link_uid": link_uid,
+                "share.redemption_uid": session["redemption_uid"],
+                "share.source_addr": addr,
+                "share.verified_email": session["verified_email"],
+                # Sender-typed free text. UNTRUSTED -- the UI must render it as
+                # such (spec §6.8); the verified address beside it is the
+                # trustworthy half.
+                "share.claimed_name": (x_claimed_name or "")[:200] or None,
+            }
+
+            def _body():
+                while True:
+                    piece = spool.read(drops.UPLOAD_CHUNK)
+                    if not piece:
+                        return
+                    yield piece
+
+            with for_creator(cfg, created_by=link.created_by, roles=roles,
+                             tenant=tenant, source_addr=addr,
+                             redemption_uid=session["redemption_uid"]) as core:
+                result = drops.store(core, folder_uid=link.resource_uid, name=name,
+                                     chunks=_body(), size_bytes=received,
+                                     landing_prefix=link.landing_prefix,
+                                     provenance=provenance)
 
         sessions.record_drop(conn, session["redemption_uid"], link_uid,
                              bytes_moved=result.size_bytes,
@@ -611,7 +628,13 @@ def content(link_uid: str, request: Request, k: Optional[str] = None,
                         # (member_uid, version_name) -- the entity and the exact
                         # revision the snapshot recorded, not whatever the file
                         # has become since (spec §6.5).
-                        yield core.get_pinned(m.member_uid, m.version_name)
+                        #
+                        # Chunk by chunk: the zip framer consumes an iterable, so
+                        # nothing larger than one chunk is ever held. Buffering a
+                        # whole member here would make peak memory the size of
+                        # the biggest file in the folder, for every concurrent
+                        # download.
+                        yield from core.stream_pinned(m.member_uid, m.version_name)
                     try:
                         yield from archive.stream(members, open_member)
                     except VersionGone:
@@ -639,19 +662,38 @@ def content(link_uid: str, request: Request, k: Optional[str] = None,
                          "Content-Disposition": 'attachment; filename="download.zip"'})
 
         # kind 0 — the single file, at the version the link recorded.
+        #
+        # The size is read first so a real Content-Length still goes out; the
+        # bytes then stream, so a 4 GiB share costs one chunk of memory rather
+        # than 4 GiB. A culled version must be detected BEFORE the response
+        # starts: once the header is on the wire the only honest failure left is
+        # dropping the connection.
         with core_ctx as core:
-            try:
-                raw = core.get_pinned(link.resource_uid, link.pinned_version or "")
-            except VersionGone:
-                # The pinned version was culled: the link is dead, uniformly
-                # (spec §6.2). Never fall back to the current version -- that
-                # is the silent substitution pinning exists to prevent.
+            if link.pinned_version and not core.has_version(link.resource_uid,
+                                                            link.pinned_version):
+                # Never fall back to the current version -- that is the silent
+                # substitution pinning exists to prevent (spec §6.2).
                 _audit_denied(cfg, link_uid=link_uid, reason="version_gone",
                               tenant=tenant, addr=client_addr(request),
                               email=session["verified_email"])
                 raise _deny()
-        return Response(content=raw, media_type="application/octet-stream",
-                        headers={"Content-Length": str(len(raw))})
+            try:
+                size = int(getattr(core.stat(link.resource_uid), "size", 0) or 0)
+            except Exception:  # noqa: BLE001
+                raise _deny()
+
+        pinned = link.pinned_version or ""
+        resource_uid = link.resource_uid
+
+        def stream_file():
+            with core_ctx as core:
+                yield from core.stream_pinned(resource_uid, pinned)
+
+        conn.close()
+        closed = True
+        return StreamingResponse(
+            stream_file(), media_type="application/octet-stream",
+            headers={"Content-Length": str(size), "Accept-Ranges": "none"})
     finally:
         if not closed:
             conn.close()
