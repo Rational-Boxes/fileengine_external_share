@@ -298,6 +298,10 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
             max_uses=body.max_uses, max_uses_per_recipient=body.max_uses_per_recipient,
             max_bytes=body.max_bytes, max_file_bytes=body.max_file_bytes,
             max_files=body.max_files or (cfg.upload_max_files if body.kind == KIND_UPLOAD else 0),
+            # Recorded in the cross-tenant directory too, so a recipient — who
+            # arrives with no tenant context at all — can be routed to the right
+            # schema. Without it a link outside the default tenant is unfindable.
+            tenant=caller.tenant,
             pinned_version=pinned_version,
             follow_folder=body.follow_folder, include_subdirs=body.include_subdirs,
             landing_prefix=body.landing_prefix, ext_allowlist=body.ext_allowlist,

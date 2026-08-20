@@ -36,6 +36,38 @@ KIND_FOLDER_DOWNLOAD = 2
 KINDS = (KIND_FILE_DOWNLOAD, KIND_UPLOAD, KIND_FOLDER_DOWNLOAD)
 
 
+# The one table that is NOT per-tenant, and the reason it has to exist.
+#
+# A recipient clicking a link from their email presents a uid and a secret and
+# nothing else — no session, no tenant, and no way to know one. The public route
+# has to resolve which tenant's schema holds that link BEFORE it can look it up,
+# and every other signal is unavailable or unreliable at that moment: there is no
+# X-Tenant header on a cold navigation, and the Host is rewritten by any proxy
+# that sets changeOrigin (the dev proxy does exactly this).
+#
+# Without it, a link minted in any tenant other than the default is
+# unredeemable — it answers with the uniform "this link isn't available",
+# which is indistinguishable from an expired link and therefore very hard to
+# diagnose from the outside.
+#
+# It holds no secret: a uid is unguessable, the secret is not stored here, and
+# anyone holding a working link learns the tenant from the content anyway.
+GLOBAL_DDL = """
+CREATE TABLE IF NOT EXISTS public.share_link_directory (
+    link_uid   UUID PRIMARY KEY,
+    tenant     TEXT        NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+
+def ensure_global_directory(conn) -> None:
+    """Create the cross-tenant link directory (idempotent)."""
+    with conn.cursor() as cur:
+        cur.execute(GLOBAL_DDL)
+    conn.commit()
+
+
 def schema_name(tenant: str) -> str:
     """`tenant_<sanitized>`, mirroring the core's own schema naming so a human
     reading two databases sees the same tenant spelled the same way."""

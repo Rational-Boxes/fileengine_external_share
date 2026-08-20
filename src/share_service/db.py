@@ -26,7 +26,7 @@ from typing import Optional
 import psycopg
 
 from .config import Config
-from .schema import ensure_tenant_schema, schema_name
+from .schema import ensure_global_directory, ensure_tenant_schema, schema_name
 
 log = logging.getLogger("share_service.db")
 
@@ -66,6 +66,10 @@ def connect_for_tenant(config: Config, tenant: str, provision: bool = False,
     conn = psycopg.connect(_dsn(config, readonly))
     if provision and not readonly and tenant not in _provisioned:
         name = ensure_tenant_schema(conn, tenant)
+        # The cross-tenant link directory, ensured alongside the first tenant
+        # schema of the process. Public redemptions need it to know WHICH
+        # tenant a link belongs to before they can look it up at all.
+        ensure_global_directory(conn)
         _provisioned.add(tenant)
     else:
         name = schema_name(tenant)

@@ -167,7 +167,8 @@ def _row_to_link(row: tuple) -> Link:
 
 def create(conn, *, kind: int, resource_uid: str, created_by: str,
            expires_at: datetime, recipients: Iterable[str],
-           secret: Optional[str] = None, **budgets: Any) -> tuple[Link, str]:
+           secret: Optional[str] = None, tenant: str = "",
+           **budgets: Any) -> tuple[Link, str]:
     """Insert a link and its recipient allowlist. Returns (link, plaintext secret).
 
     The secret is returned, never stored — this is the only moment it exists
@@ -215,8 +216,43 @@ def create(conn, *, kind: int, resource_uid: str, created_by: str,
                 """INSERT INTO share_link_recipients (link_uid, email, invited_by)
                    VALUES (%s,%s,%s) ON CONFLICT DO NOTHING""",
                 (link_uid, email, created_by))
+
+        # Cross-tenant directory, in the SAME transaction as the link itself.
+        # A link that exists but is not in the directory is unredeemable — the
+        # public route cannot discover which schema to look in — so the two must
+        # commit together or not at all.
+        if tenant:
+            cur.execute(
+                """INSERT INTO public.share_link_directory (link_uid, tenant)
+                   VALUES (%s,%s) ON CONFLICT (link_uid) DO NOTHING""",
+                (link_uid, tenant))
     conn.commit()
     return get(conn, link_uid), secret
+
+
+def tenant_for_link(conn, link_uid: str) -> Optional[str]:
+    """Which tenant holds this link, from the cross-tenant directory.
+
+    The public door's first question. A recipient arrives with a uid and a
+    secret and no tenant context whatsoever, so without this a link minted
+    outside the default tenant is simply unfindable.
+
+    Returns None for an unknown uid, which the caller turns into the same
+    uniform 404 as everything else — this must not become a way to test whether
+    a uid exists.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT tenant FROM public.share_link_directory WHERE link_uid = %s",
+                    (link_uid,))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def forget_link(conn, link_uid: str) -> None:
+    """Drop a link's directory entry — called when the row itself is purged."""
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM public.share_link_directory WHERE link_uid = %s",
+                    (link_uid,))
 
 
 def revoke(conn, link_uid: str, revoked_by: str) -> bool:

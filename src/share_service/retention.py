@@ -109,6 +109,10 @@ def sweep_tenant(config: Config, tenant: str, *, limit: int = 500) -> dict:
                             (link_uid,))
                 cur.execute("DELETE FROM share_links WHERE link_uid = %s",
                             (link_uid,))
+                # ...and its cross-tenant directory entry, or the directory
+                # accumulates rows pointing at links that no longer exist.
+                cur.execute("DELETE FROM public.share_link_directory "
+                            "WHERE link_uid = %s", (link_uid,))
             # Committed per link, so an interruption leaves whole links purged
             # rather than a link stripped of its recipients but still listed.
             conn.commit()

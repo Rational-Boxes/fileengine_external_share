@@ -174,9 +174,26 @@ def _resolve(request: Request, link_uid: str, secret: Optional[str]):
         # else: an outside caller learns nothing about why.
         raise _deny()
 
-    tenant = request.headers.get("x-tenant") or cfg.default_tenant
     if not secret:
         raise _deny()
+
+    # WHICH TENANT? A recipient clicking a link in their email presents a uid and
+    # a secret and nothing else. There is no session, no X-Tenant header on a
+    # cold navigation, and the Host is rewritten by any proxy setting
+    # changeOrigin — so the tenant has to come from the link itself.
+    #
+    # An explicit X-Tenant still wins, for a caller that genuinely knows (tests,
+    # and a future per-tenant edge). Otherwise the cross-tenant directory
+    # answers it, and only then do we fall back to the default.
+    tenant = request.headers.get("x-tenant") or ""
+    if not tenant:
+        directory = db.connect_for_tenant(cfg, cfg.default_tenant, provision=True)
+        try:
+            tenant = links.tenant_for_link(directory, link_uid) or cfg.default_tenant
+        except Exception:  # noqa: BLE001 - an unresolvable tenant denies, uniformly
+            raise _deny()
+        finally:
+            directory.close()
 
     conn = db.connect_for_tenant(cfg, tenant, provision=True)
     try:
