@@ -1,13 +1,30 @@
 # share_service — Development Plan
 
-Status: **M0 not started.** This plan covers **M0 only** — the service skeleton,
-the data model, the delegated core client, and link creation/listing/revocation.
-It stops deliberately short of the public door: nothing in M0 is reachable
-without a bearer token, and no recipient can redeem anything yet.
+Status: **M0 complete** (2026-08-20) — skeleton, per-tenant schema, delegated
+core client, bearer auth, the authority pre-flight, and the owner-side routes.
+30 tests pass, 16 of them `@live` against a dev core, LDAP, Postgres and Redis;
+`tools/check-core-untouched.sh` reports the core untouched. This plan covers
+**M0 only**. It stops deliberately short of the public door: nothing here is
+reachable without a bearer token, and no recipient can redeem anything yet.
+Later milestones are in the specification's §14.
+
+**Build notes** — things that were true in the code but not in this plan:
+
+- `DirectoryEntry` exposes `is_container`; `is_dir` is on `FileInfo`. Asking for
+  the wrong one returns `None`, which looks exactly like an empty directory.
+- `Config()` reads the environment but does not load `.env` — `get_config()`
+  does that at startup. Tests construct `Config` directly, so `conftest.py`
+  loads the dotenv once; without it the live tests skip for a "missing" secret
+  that is sitting in `.env`.
+- The container **must** install `audit_service` (see `Containerfile`).
+  `ldap_manager`'s image does not, and simply runs unaudited — which is safe
+  for its emitter's semantics and would be a dead container here, since no
+  publisher means the feature refuses to operate.
+- There is no CI in any of these repos, so the empty-core-diff criterion ships
+  as `tools/check-core-untouched.sh` rather than a workflow file.
 
 Companion: [`design_documents/OUTSIDE_SHARE_LINKS.md`](design_documents/OUTSIDE_SHARE_LINKS.md)
-(the specification; section references below are to it). Later milestones are
-listed in its §14.
+— the specification; section references below are to it.
 
 ## 1. What M0 delivers
 
@@ -129,9 +146,9 @@ service constrains *which* uid gets asked for (§4.3 of the spec). The rule:
 - Structure it so this is unexpressible rather than merely checked: the request
   model for these routes has no uid field to populate.
 
-## 5. Build order
+## 5. Build order — all complete
 
-Each step is independently reviewable and leaves the repo working.
+Each step was independently reviewable and left the repo working.
 
 1. **Skeleton.** `pyproject.toml` (src layout, `share-service = "share_service.app:main"`),
    `Config` (`FILEENGINE_*` + `SHARE_*`), FastAPI app, `metrics.py` verbatim,
