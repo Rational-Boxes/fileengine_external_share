@@ -67,6 +67,8 @@ from .auth import client_addr
 from .config import Config
 from .core_client import READ, WRITE, VersionGone, for_creator
 from .ldap_roles import LdapUnavailable, UnknownUser, resolve_share_roles
+from . import notify
+from .notify import get_publisher
 from .schema import KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD, KIND_UPLOAD
 
 log = logging.getLogger("share_service.public")
@@ -302,6 +304,13 @@ def identify(link_uid: str, body: IdentifyIn, request: Request,
                       link_uid, result.error)
             _audit_denied(cfg, link_uid=link_uid, reason="otp_send_failed",
                           tenant=tenant, addr=addr, email=email)
+            # ...and tell the creator, who otherwise cannot distinguish a mail
+            # misconfiguration from a recipient who mistyped their address.
+            # The `detail` names the address but not the failure internals.
+            get_publisher(cfg).publish(
+                notify.OTP_SEND_FAILED, tenant=tenant, creator=link.created_by,
+                link_uid=link_uid, file_uid=link.resource_uid,
+                detail=f"could not email a code to {email}")
     else:
         _audit_denied(cfg, link_uid=link_uid, reason="unlisted_address",
                       tenant=tenant, addr=addr, email=email)
@@ -410,6 +419,16 @@ def open_session(link_uid: str, body: SessionIn, request: Request,
         except AuditUnavailable:
             log.error("share_link_redeem NOT durable for %s — refusing", link_uid)
             raise _deny()
+
+        # The confirmation a sender is waiting for, having posted the link
+        # themselves — and it carries a VERIFIED name, which is the part they
+        # cannot get any other way. Only the first: every later use is routine.
+        if session.first_use:
+            get_publisher(cfg).publish(
+                notify.FIRST_REDEMPTION, tenant=tenant, creator=link.created_by,
+                link_uid=link_uid, file_uid=link.resource_uid,
+                actor=f"share:{link_uid}|{email}",
+                detail=f"{email} opened your link")
 
         payload = {"redemption_uid": session.redemption_uid,
                    "expires_at": session.expires_at,
@@ -579,6 +598,16 @@ async def drop_file(link_uid: str, request: Request, k: Optional[str] = None,
                     "verified_email": session["verified_email"],
                     "stored_name": result.stored_name,
                     "size_bytes": result.size_bytes})
+
+        # The creator's only inbound signal. A drop box nobody watches is
+        # useless, and v1 sends the creator no mail at all (spec §10.6).
+        # Published AFTER the audit emit and never allowed to fail the request:
+        # a missed Dashboard item must not undo a delivered file.
+        get_publisher(cfg).publish(
+            notify.DROP_RECEIVED, tenant=tenant, creator=link.created_by,
+            link_uid=link_uid, file_uid=result.file_uid,
+            actor=f"share:{link_uid}|{session['verified_email']}",
+            detail=f"{session['verified_email']} sent {result.stored_name}")
 
         # The sender is told what it was actually stored as, since a collision
         # renames it -- otherwise "did my file arrive?" has no answer.

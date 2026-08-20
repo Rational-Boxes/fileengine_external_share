@@ -69,6 +69,9 @@ class Session:
     archive_bytes: Optional[int] = None
     members_served: int = 0
     members_omitted: int = 0
+    # First use of this link, ever. The creator posted the URL themselves and is
+    # waiting to hear it arrived (spec §10.6); every later use is routine.
+    first_use: bool = False
 
 
 def _consume_use(conn, link_uid: str, email: str) -> Optional[dict]:
@@ -109,7 +112,8 @@ def _consume_use(conn, link_uid: str, email: str) -> Optional[dict]:
                    SET uses_consumed = uses_consumed + 1
                  WHERE link_uid = %(link)s AND EXISTS (SELECT 1 FROM rcpt)
                 RETURNING kind, resource_uid, created_by, pinned_version,
-                          max_bytes, bytes_consumed, include_subdirs
+                          max_bytes, bytes_consumed, include_subdirs,
+                          uses_consumed
             )
             SELECT * FROM pool
             """,
@@ -120,7 +124,10 @@ def _consume_use(conn, link_uid: str, email: str) -> Optional[dict]:
         return None
     return {"kind": row[0], "resource_uid": str(row[1]), "created_by": row[2],
             "pinned_version": row[3], "max_bytes": row[4],
-            "bytes_consumed": row[5], "include_subdirs": row[6]}
+            "bytes_consumed": row[5], "include_subdirs": row[6],
+            # The POST-update value, from the same statement — so "was this the
+            # first?" needs no second query and cannot race another redemption.
+            "uses_consumed": row[7]}
 
 
 def open_session(conn, cfg: Config, *, link_uid: str, verified_email: str,
@@ -192,7 +199,8 @@ def open_session(conn, cfg: Config, *, link_uid: str, verified_email: str,
     return Session(redemption_uid=redemption_uid, link_uid=link_uid,
                    verified_email=verified_email, expires_at=expires_at,
                    members=members, archive_bytes=exact_bytes,
-                   members_served=len(frozen), members_omitted=omitted)
+                   members_served=len(frozen), members_omitted=omitted,
+                   first_use=link.get("uses_consumed") == 1)
 
 
 def record_drop(conn, redemption_uid: str, link_uid: str, *, bytes_moved: int,

@@ -396,6 +396,58 @@ def list_my_links(request: Request, live: bool = True, all: bool = False,
         "truncated": bool(rows and rows[0].get("truncated"))}
 
 
+@router.get("/links/mine/inbox")
+def sharing_inbox(request: Request,
+                  caller: Caller = Depends(get_caller)) -> dict:
+    """The Dashboard's Sharing panel: "what have I got open right now" (§10.6).
+
+    Grouped rather than flat, because the three groups want different reactions:
+    something is wrong, something arrived, and everything else is fine.
+
+    This is ALSO where "your link stopped working" is detected. That state has no
+    triggering event — nothing happens when an ACL three folders up is edited —
+    so rather than build a watcher, the pre-flight is evaluated here, bounded by
+    the caller's own live-link count. A link that is dead but unnoticed costs
+    nothing until someone looks, and this is the moment someone looks.
+    """
+    cfg = _config(request)
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        live = links.list_for_creator(conn, caller.user, live_only=True)
+        counts = {l.link_uid: links.count_recipients(conn, l.link_uid) for l in live}
+    finally:
+        conn.close()
+
+    # Per LINK, not once for the caller: the most common way a link dies is an
+    # ACL change on its own resource, so one answer for the whole set would miss
+    # exactly the case this exists to catch. check_many resolves the creator's
+    # LDAP roles once and shares a single core connection, so the cost is one
+    # directory round-trip plus one gRPC call per link rather than N of each.
+    verdicts = preflight.check_many(
+        cfg, created_by=caller.user, tenant=caller.tenant,
+        targets=[(l.link_uid, l.resource_uid, l.pinned_version or "") for l in live],
+        source_addr=caller.source_addr)
+
+    needs, drops_, active = [], [], []
+    for l in live:
+        row = _link_json(l)
+        row["recipient_count"] = counts.get(l.link_uid, 0)
+        verdict = verdicts.get(l.link_uid)
+        if verdict is not None and not verdict.ok:
+            row["status"] = "not_working"
+            row["not_working_reason"] = verdict.reason
+            row["not_working_message"] = preflight.creator_message(verdict)
+        if row["status"] == "not_working" or l.status() == "blocked":
+            needs.append(row)
+        elif l.kind == KIND_UPLOAD:
+            drops_.append(row)
+        else:
+            active.append(row)
+
+    # "Needs attention" is empty most days, and that emptiness is the point.
+    return {"needs_attention": needs, "drop_boxes": drops_, "active": active}
+
+
 @router.post("/admin/revoke-all")
 def admin_revoke_all(body: RevokeAllRequest, request: Request,
                      caller: Caller = Depends(get_caller)) -> dict:

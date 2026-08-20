@@ -110,6 +110,65 @@ def check(config: Config, *, created_by: str, tenant: str, resource_uid: str,
     return PreflightResult(True, REASON_OK, roles=roles)
 
 
+def check_many(config: Config, *, created_by: str, tenant: str,
+               targets, source_addr: str = "") -> dict:
+    """`check` across several of one creator's links, sharing the expensive work.
+
+    `targets` is an iterable of ``(key, resource_uid, pinned_version)``. Returns
+    ``{key: PreflightResult}``.
+
+    Same answers as calling `check` per link, but the creator's roles are
+    resolved from LDAP ONCE and a single core connection serves every resource —
+    otherwise a Dashboard load becomes N directory round-trips plus N gRPC
+    channels for a panel that is usually all-green.
+
+    The per-RESOURCE checks are still per resource, deliberately. The most
+    common way a link dies is an ACL change on its own resource, so collapsing
+    those into one answer for the whole set would miss precisely the case this
+    exists to catch.
+    """
+    targets = list(targets)
+    if not targets:
+        return {}
+    try:
+        roles = ldap_roles.resolve_share_roles(config, created_by)
+    except ldap_roles.UnknownUser:
+        r = PreflightResult(False, REASON_UNKNOWN_CREATOR,
+                            detail=f"{created_by} is not in the directory")
+        return {k: r for k, _uid, _v in targets}
+    except ldap_roles.LdapUnavailable as e:
+        log.warning("preflight denied: LDAP unavailable resolving %s: %s", created_by, e)
+        r = PreflightResult(False, REASON_LDAP, detail=str(e))
+        return {k: r for k, _uid, _v in targets}
+
+    out = {}
+    try:
+        with core_client.for_creator(config, created_by=created_by, roles=roles,
+                                     tenant=tenant, source_addr=source_addr) as core:
+            for key, resource_uid, pinned in targets:
+                try:
+                    # Existence FIRST — read-by-default means a missing uid
+                    # passes the permission check (spec §6.3).
+                    if not core.exists(resource_uid):
+                        out[key] = PreflightResult(False, REASON_GONE, roles=roles)
+                    elif not core.check_permission(resource_uid, core_client.READ):
+                        out[key] = PreflightResult(False, REASON_NO_ACCESS, roles=roles)
+                    elif pinned and not core.has_version(resource_uid, pinned):
+                        out[key] = PreflightResult(False, REASON_VERSION_GONE, roles=roles)
+                    else:
+                        out[key] = PreflightResult(True, REASON_OK, roles=roles)
+                except Exception as e:  # noqa: BLE001
+                    # One bad resource must not blank the whole panel.
+                    log.warning("preflight failed for %s on %s: %s",
+                                created_by, resource_uid, e)
+                    out[key] = PreflightResult(False, REASON_GONE, roles=roles)
+    except Exception as e:  # noqa: BLE001 - core unreachable: deny, do not leak
+        log.warning("preflight denied: core unavailable for %s: %s", created_by, e)
+        r = PreflightResult(False, REASON_GONE, roles=roles, detail=str(e))
+        return {k: out.get(k, r) for k, _uid, _v in targets}
+    return out
+
+
 def creator_message(result: PreflightResult) -> str:
     """A sentence the creator can act on. Not for outside callers."""
     return {

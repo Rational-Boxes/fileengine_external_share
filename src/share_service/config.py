@@ -129,6 +129,26 @@ class Config:
         # does not quietly disable the recording.
         self.audit_enabled = _bool("FILEENGINE_AUDIT_ENABLED", True)
 
+        # --- Creator notifications (SHARED stream, PRIVATE selection) ------
+        # Share events are published onto the same stream the core uses, where
+        # discussion's consumer already listens (spec §10.6). No new transport.
+        #
+        # WHICH events raise an attention item is decided HERE and nowhere else:
+        # the consumer raises whatever arrives, so an operator turning one on
+        # sees it take effect rather than hitting a second gate downstream.
+        self.redis_host = _env("FILEENGINE_REDIS_HOST", "localhost")
+        self.redis_port = _int("FILEENGINE_REDIS_PORT", 6379)
+        self.redis_password = _env("FILEENGINE_REDIS_PASSWORD", "")
+        self.redis_db = _int("FILEENGINE_REDIS_DB", 0)
+        self.events_stream = _env("FILEENGINE_EVENTS_STREAM", "fileengine:events")
+        # budget_exhausted / expiry_soon are available and OFF by default —
+        # they are the two most likely to become noise (spec §9).
+        self.attention_events = tuple(
+            e.strip() for e in
+            _env("SHARE_ATTENTION_EVENTS",
+                 "drop_received,otp_send_failed,link_dead,first_redemption").split(",")
+            if e.strip())
+
         # --- This service's own Postgres (PRIVATE SHARE_*) -----------------
         self.pg_host = _env("SHARE_PG_HOST", "localhost")
         self.pg_port = _int("SHARE_PG_PORT", 5434)

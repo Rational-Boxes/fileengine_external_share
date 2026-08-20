@@ -94,12 +94,27 @@ def conn(cfg):
     c.close()
 
 
+@pytest.fixture
+def real_folder(cfg) -> str:
+    """A folder that actually exists in the dev core, so the pre-flight passes."""
+    from share_service import core_client, ldap_roles
+    roles = ldap_roles.resolve_share_roles(cfg, ADMIN)
+    with core_client.for_creator(cfg, created_by=ADMIN, roles=roles,
+                                 tenant=TENANT) as core:
+        for e in core.client.dir("") or []:
+            if getattr(e, "is_container", False):
+                return e.uid
+    pytest.skip("no directory available in the dev core")
+
+
 def _mint(cfg, conn, *, created_by: str, recipients=("a@example.com",),
-          depth=3, path="/projects/deep/file.txt", **kw):
+          depth=3, path="/projects/deep/file.txt", kind_override=0,
+          resource_uid=None, **kw):
     """A link inserted directly, so a test can place several creators, depths
     and recipient sets without needing that many real resources in the core."""
     link, _secret = links.create(
-        conn, kind=0, resource_uid=str(uuid.uuid4()), created_by=created_by,
+        conn, kind=kind_override, resource_uid=resource_uid or str(uuid.uuid4()),
+        created_by=created_by,
         expires_at=links.clamp_expiry(cfg, None, 1), recipients=list(recipients),
         max_uses=5, resource_depth=depth, resource_path=path, **kw)
     return link
@@ -340,3 +355,70 @@ def test_an_uncapped_list_does_not_claim_truncation(client, admin, cfg, conn,
     _mint(cfg, conn, created_by=OTHER)
     r = client.get("/share/v1/links?all=true", headers=admin)
     assert r.json()["truncated"] is False
+
+
+# --- the Dashboard's Sharing panel (spec §10.6) ---------------------------
+
+def test_the_inbox_groups_by_what_the_user_should_do_about_it(client, admin,
+                                                              cfg, conn):
+    """Three groups because they want three different reactions: something is
+    wrong, something arrived, everything else is fine."""
+    r = client.get("/share/v1/links/mine/inbox", headers=admin)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body) == {"needs_attention", "drop_boxes", "active"}
+
+
+def test_the_inbox_is_only_the_callers_own_links(client, plain, cfg, conn):
+    """Not the tenant's. The admin console is a separate surface."""
+    mine = _mint(cfg, conn, created_by=OTHER)
+    _mint(cfg, conn, created_by=ADMIN)
+    body = client.get("/share/v1/links/mine/inbox", headers=plain).json()
+    seen = {l["link_uid"] for g in body.values() for l in g}
+    assert mine.link_uid in seen
+    assert all(l["created_by"] == OTHER for g in body.values() for l in g)
+
+
+def test_a_drop_box_is_not_filed_under_active_links(client, admin, cfg, conn,
+                                                    real_folder):
+    """A drop box is a thing you are WAITING ON — the one share shape with an
+    inbox character — so it does not belong in the outbound list.
+
+    Uses the directory-resident user and a REAL resource, because the pre-flight
+    runs for real here: a fabricated uid, or a creator LDAP has never heard of,
+    both land the row in needs_attention. Both are correct behaviour and neither
+    is what this test is about.
+    """
+    box = _mint(cfg, conn, created_by=ADMIN, kind_override=1,
+                resource_uid=real_folder)
+    body = client.get("/share/v1/links/mine/inbox", headers=admin).json()
+    assert box.link_uid in {l["link_uid"] for l in body["drop_boxes"]}
+    assert box.link_uid not in {l["link_uid"] for l in body["active"]}
+
+
+def test_a_creator_the_directory_does_not_know_has_every_link_flagged(client,
+                                                                      plain,
+                                                                      cfg, conn):
+    """The departed-employee state seen from the other side.
+
+    Their links keep existing but none of them would redeem, and the panel says
+    so per row rather than showing a green list that lies.
+    """
+    _mint(cfg, conn, created_by=OTHER)
+    body = client.get("/share/v1/links/mine/inbox", headers=plain).json()
+    assert body["active"] == [] and body["drop_boxes"] == []
+    assert body["needs_attention"]
+    assert all(l["status"] == "not_working" for l in body["needs_attention"])
+
+
+def test_a_dead_link_lands_in_needs_attention_with_a_reason(client, plain,
+                                                            cfg, conn):
+    """The resource uid is fabricated, so the pre-flight finds it gone — which
+    is the state the creator otherwise learns about from their recipient."""
+    dead = _mint(cfg, conn, created_by=OTHER)      # random uid, not in the core
+    body = client.get("/share/v1/links/mine/inbox", headers=plain).json()
+    row = next((l for l in body["needs_attention"] if l["link_uid"] == dead.link_uid),
+               None)
+    assert row is not None, "a link to a non-existent resource must be flagged"
+    assert row["status"] == "not_working"
+    assert row["not_working_message"]
