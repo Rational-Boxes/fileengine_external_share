@@ -739,3 +739,93 @@ def test_the_timing_signal_never_reaches_the_recipient(client, cfg, roles, tree,
     assert scripted.status_code == human.status_code
     assert scripted.text == human.text, "a scripted attempt must read as a typo"
     assert "timing" not in scripted.text.lower()
+
+
+# --- the downloaded file's NAME ------------------------------------------
+
+def test_a_file_download_carries_its_real_filename(client, cfg, roles, tree,
+                                                   verified):
+    """Without Content-Disposition the browser names the saved file after the
+    last path segment — literally "content", with no extension."""
+    _root, f = tree
+    link, secret = _file_link(cfg, roles, f)
+    r = _fetch(client, link, secret, verified)
+    assert r.status_code == 200
+    cd = r.headers["content-disposition"]
+    assert cd.startswith("attachment")
+    assert "doc.txt" in cd
+    assert "filename*=UTF-8''" in cd, "the RFC 5987 form must be present too"
+
+
+def test_a_folder_download_is_named_after_the_folder(client, cfg, roles, tree,
+                                                     verified):
+    root, _f = tree
+    link, secret = _mint(cfg, roles, root)
+    r = client.post(f"/share/v1/public/{link.link_uid}/session",
+                    headers=_h(secret, **{"X-Recipient-Token": verified}),
+                    json={"email": RECIPIENT})
+    assert r.status_code == 200, r.text
+    got = client.get(f"/share/v1/public/{link.link_uid}/content",
+                     headers=_h(secret, **{"X-Redemption-Uid":
+                                           r.json()["redemption_uid"]}))
+    cd = got.headers["content-disposition"]
+    assert cd.startswith("attachment")
+    assert ".zip" in cd
+    # ...and NOT the old fixed name, which the middleware used to discard anyway.
+    assert "download.zip" not in cd
+
+
+def test_the_hardening_middleware_no_longer_discards_the_filename(client, cfg,
+                                                                  roles, tree,
+                                                                  verified):
+    """The middleware overwrote Content-Disposition unconditionally, so the
+    folder route's filename was set and then silently thrown away. It may still
+    force `attachment`; it may no longer erase the name."""
+    _root, f = tree
+    link, secret = _file_link(cfg, roles, f)
+    r = _fetch(client, link, secret, verified)
+    assert r.headers["content-disposition"] != "attachment"
+
+
+def test_every_other_response_still_gets_the_bare_attachment(client):
+    """The anti-XSS boundary is unchanged for anything that sets no filename —
+    including a 404, where the header still has to be present."""
+    r = client.get(f"/share/v1/public/{uuid.uuid4()}", headers={"X-Share-Secret": "x"})
+    assert r.status_code == 404
+    assert r.headers["content-disposition"] == "attachment"
+
+
+@pytest.mark.parametrize("supplied,expect", [
+    ('attachment; filename="a.pdf"', 'attachment; filename="a.pdf"'),  # name kept
+    ('inline; filename="a.html"', 'attachment'),                       # downgrade replaced
+    ('INLINE', 'attachment'),
+    ('form-data; name="x"', 'attachment'),
+])
+def test_a_route_cannot_downgrade_the_disposition(cfg, supplied, expect):
+    """A filename is a route's business; the DISPOSITION is not.
+
+    `inline` on the SPA's origin is the XSS hole this header exists to close
+    (spec §8.3) — a shared .html would otherwise run script on the origin that
+    holds the bearer token. So the middleware honours a filename and replaces
+    anything that is not an attachment.
+
+    Exercised through a real route mounted under the public prefix, because the
+    thing under test IS the middleware; asserting the rule against a
+    reimplementation of it would pass no matter what the middleware did.
+    """
+    from fastapi import Response as FastResponse
+    app = create_app(cfg)
+
+    # THREE segments past the prefix, deliberately. The public router already
+    # owns /{link_uid} and /{link_uid}/<sub>, so a shorter probe path is
+    # swallowed by the peek route — which answers the uniform 404 and made an
+    # earlier version of this test quietly assert the middleware's behaviour on
+    # a 404 body instead of on the probe.
+    @app.get("/share/v1/public/__probe/__a/__b")
+    def _probe() -> FastResponse:                      # noqa: ANN202
+        return FastResponse(b"x", headers={"Content-Disposition": supplied})
+
+    got = TestClient(app, raise_server_exceptions=False).get(
+        "/share/v1/public/__probe/__a/__b")
+    assert got.status_code == 200, "the probe route must actually be reached"
+    assert got.headers["content-disposition"] == expect

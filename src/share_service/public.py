@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+import urllib.parse
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
@@ -105,6 +106,20 @@ def install_hardening(app) -> None:
         response = await call_next(request)
         if request.url.path.startswith(router.prefix):
             for k, v in _HARDENING.items():
+                if k == "Content-Disposition":
+                    # A route may add a FILENAME; it may never downgrade the
+                    # disposition. Overwriting unconditionally (which this used
+                    # to do) silently discarded the filename the content route
+                    # set, and every download saved as "content" — the last
+                    # path segment, which is what a browser falls back to.
+                    #
+                    # Only an `attachment` from the route is honoured. Anything
+                    # else, including `inline`, is replaced: that is the
+                    # anti-XSS boundary (spec §8.3) and it is not a route's
+                    # decision to make.
+                    existing = response.headers.get(k, "")
+                    if existing.strip().lower().startswith("attachment"):
+                        continue
                 response.headers[k] = v
         return response
 
@@ -117,6 +132,30 @@ def _json(payload: dict, status_code: int = status.HTTP_200_OK) -> JSONResponse:
     render time, after the handler has already succeeded.
     """
     return JSONResponse(jsonable_encoder(payload), status_code=status_code)
+
+
+def _disposition(name: str, fallback: str) -> str:
+    """`Content-Disposition` for a download, with the name the file actually has.
+
+    Without a filename the browser names the saved file after the last path
+    segment — which for this route is literally "content", with no extension.
+
+    Two forms are emitted, per RFC 6266/5987. `filename=` carries an ASCII-safe
+    version for old clients; `filename*=UTF-8''…` carries the real one. Names
+    here come from the core and are routinely non-ASCII, and a bare `filename=`
+    with raw UTF-8 in it is not something every client parses the same way.
+
+    Quotes, backslashes and control characters are stripped rather than escaped:
+    this header is parsed by a lot of different code, and a name is not worth a
+    header-splitting bug.
+    """
+    raw = (name or "").strip() or fallback
+    raw = raw.replace("\r", "").replace("\n", "")
+    ascii_name = "".join(
+        c for c in raw if 32 <= ord(c) < 127 and c not in '"\\'
+    ).strip() or fallback
+    quoted = urllib.parse.quote(raw, safe="")
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted}"
 
 
 def _deny() -> HTTPException:
@@ -717,6 +756,17 @@ def content(link_uid: str, request: Request, k: Optional[str] = None,
                                redemption_uid=session["redemption_uid"])
 
         if link.kind == KIND_FOLDER_DOWNLOAD:
+            # The folder's own name, for the archive filename. Best-effort: a
+            # download must not fail because the name could not be read, so a
+            # failure here falls back to "download.zip" rather than denying.
+            folder_name = ""
+            try:
+                with core_ctx as core:
+                    folder_name = str(getattr(core.stat(link.resource_uid),
+                                              "name", "") or "")
+            except Exception:  # noqa: BLE001
+                folder_name = ""
+
             frozen = set(session["frozen_members"] or [])
             members = [m for m in snapshot_mod.load(conn, link_uid)
                        if m.is_dir or m.member_uid in frozen]
@@ -759,7 +809,13 @@ def content(link_uid: str, request: Request, k: Optional[str] = None,
                 stream_zip(), media_type="application/zip",
                 headers={"Content-Length": str(declared),
                          "Accept-Ranges": "none",
-                         "Content-Disposition": 'attachment; filename="download.zip"'})
+                         # The folder's own name, so the recipient gets
+                         # "Q3 Drawings.zip" rather than a generic one. This
+                         # header used to be discarded by the hardening
+                         # middleware, which overwrote it unconditionally.
+                         "Content-Disposition": _disposition(
+                             f"{folder_name}.zip" if folder_name else "",
+                             "download.zip")})
 
         # kind 0 — the single file, at the version the link recorded.
         #
@@ -778,7 +834,12 @@ def content(link_uid: str, request: Request, k: Optional[str] = None,
                               email=session["verified_email"])
                 raise _deny()
             try:
-                size = int(getattr(core.stat(link.resource_uid), "size", 0) or 0)
+                info = core.stat(link.resource_uid)
+                size = int(getattr(info, "size", 0) or 0)
+                # Read in the same call as the size: the browser names the saved
+                # file from Content-Disposition, and without one it falls back to
+                # the last path segment — "content", with no extension.
+                file_name = str(getattr(info, "name", "") or "")
             except Exception:  # noqa: BLE001
                 raise _deny()
 
@@ -793,7 +854,8 @@ def content(link_uid: str, request: Request, k: Optional[str] = None,
         closed = True
         return StreamingResponse(
             stream_file(), media_type="application/octet-stream",
-            headers={"Content-Length": str(size), "Accept-Ranges": "none"})
+            headers={"Content-Length": str(size), "Accept-Ranges": "none",
+                     "Content-Disposition": _disposition(file_name, "download")})
     finally:
         if not closed:
             conn.close()
