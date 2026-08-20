@@ -452,3 +452,174 @@ def test_folder_members_pin_their_version_too(client, cfg, roles, tree, verified
     assert r.status_code == 200
     zf = zipfile.ZipFile(io.BytesIO(r.content))
     assert zf.read("doc.txt") == b"the payload"
+
+
+# --- 7. the drop box ------------------------------------------------------
+
+def _drop_link(cfg, roles, folder_uid, **kw):
+    conn = db.connect_for_tenant(cfg, TENANT, provision=True)
+    try:
+        return links.create(
+            conn, kind=1, resource_uid=folder_uid, created_by=USER,
+            expires_at=links.clamp_expiry(cfg, None, 1),
+            recipients=[RECIPIENT], max_uses=kw.pop("max_uses", 5),
+            max_files=kw.pop("max_files", 3), **kw)
+    finally:
+        conn.close()
+
+
+def _open(client, link, secret, verified):
+    r = client.post(f"/share/v1/public/{link.link_uid}/session",
+                    headers=_h(secret, **{"X-Recipient-Token": verified}),
+                    json={"email": RECIPIENT})
+    assert r.status_code == 200, r.text
+    return r.json()["redemption_uid"]
+
+
+def _drop(client, link, secret, redemption, name, body, **extra):
+    return client.post(
+        f"/share/v1/public/{link.link_uid}/files",
+        headers=_h(secret, **{"X-Redemption-Uid": redemption,
+                              "X-File-Name": name, **extra}),
+        content=body)
+
+
+def test_a_drop_lands_owned_by_the_creator_with_its_origin_recorded(
+        client, cfg, roles, tree, verified):
+    root, _ = tree
+    link, secret = _drop_link(cfg, roles, root)
+    redemption = _open(client, link, secret, verified)
+
+    r = _drop(client, link, secret, redemption, "delivery.txt", b"from outside",
+              **{"X-Claimed-Name": "Bob from Contractor Ltd"})
+    assert r.status_code == 201, r.text
+    assert r.json()["stored_name"] == "delivery.txt"
+
+    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+        entry = next(e for e in core.client.dir(root) if e.name == "delivery.txt")
+        assert core.client.get(entry.uid).getvalue() == b"from outside"
+        meta = core.client.get_metadata_values(entry.uid)
+        # Owned by the creator so inherited ACLs behave normally; the outside
+        # origin lives in metadata instead (spec §6.8).
+        assert meta["share.verified_email"] == RECIPIENT
+        assert meta["share.link_uid"] == link.link_uid
+        assert meta["share.claimed_name"] == "Bob from Contractor Ltd"
+
+
+def test_a_drop_never_versions_an_existing_file(client, cfg, roles, tree, verified):
+    """An outside sender must not be able to inject a revision into a document's
+    history -- poisoning the "latest" of a file others trust (spec §6.7)."""
+    root, doc = tree
+    link, secret = _drop_link(cfg, roles, root)
+    redemption = _open(client, link, secret, verified)
+
+    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+        before = len(core.client.revisions(doc))
+
+    r = _drop(client, link, secret, redemption, "doc.txt", b"REPLACEMENT")
+    assert r.status_code == 201
+    assert r.json()["stored_name"] == "doc.txt (1)" or \
+        r.json()["stored_name"].startswith("doc (1)")
+
+    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+        assert len(core.client.revisions(doc)) == before      # untouched
+        assert core.client.get(doc).getvalue() == b"the payload"
+
+
+def test_the_file_budget_binds_and_is_not_the_session_budget(client, cfg, roles,
+                                                             tree, verified):
+    """max_files counts files; max_uses counts sessions (spec §6.4)."""
+    root, _ = tree
+    link, secret = _drop_link(cfg, roles, root, max_files=2, max_uses=5)
+    redemption = _open(client, link, secret, verified)
+
+    for i in range(2):
+        assert _drop(client, link, secret, redemption,
+                     f"f{i}.txt", b"x").status_code == 201
+    r = _drop(client, link, secret, redemption, "f2.txt", b"x")
+    assert r.status_code == 409
+
+    conn = db.connect_for_tenant(cfg, TENANT)
+    try:
+        live = links.get(conn, link.link_uid)
+        assert live.files_consumed == 2
+        assert live.uses_consumed == 1        # one session, two files
+    finally:
+        conn.close()
+
+
+def test_an_oversized_file_is_refused_and_costs_no_slot(client, cfg, roles, tree,
+                                                        verified):
+    """The slot is released when the store does not happen, so a rejected upload
+    does not silently spend the sender's budget."""
+    root, _ = tree
+    link, secret = _drop_link(cfg, roles, root, max_files=2, max_file_bytes=16)
+    redemption = _open(client, link, secret, verified)
+
+    r = _drop(client, link, secret, redemption, "big.bin", b"x" * 5000)
+    assert r.status_code == 413
+
+    conn = db.connect_for_tenant(cfg, TENANT)
+    try:
+        assert links.get(conn, link.link_uid).files_consumed == 0
+    finally:
+        conn.close()
+    # ...and the budget really is intact.
+    assert _drop(client, link, secret, redemption, "ok.txt", b"small").status_code == 201
+
+
+def test_the_extension_allowlist_is_applied_to_the_claimed_name(client, cfg, roles,
+                                                                tree, verified):
+    root, _ = tree
+    link, secret = _drop_link(cfg, roles, root, ext_allowlist=["pdf", "txt"])
+    redemption = _open(client, link, secret, verified)
+    assert _drop(client, link, secret, redemption, "x.exe", b"MZ").status_code == 400
+    assert _drop(client, link, secret, redemption, "x.txt", b"hi").status_code == 201
+
+
+@pytest.mark.parametrize("hostile", [
+    "../../escape.txt", "/etc/passwd", "..", ".hidden", "a/b.txt", "x\x00.txt",
+])
+def test_a_sender_cannot_steer_where_the_file_lands(client, cfg, roles, tree,
+                                                    verified, hostile):
+    """The destination comes from the link record; the name is only a name."""
+    root, _ = tree
+    link, secret = _drop_link(cfg, roles, root)
+    redemption = _open(client, link, secret, verified)
+    r = _drop(client, link, secret, redemption, hostile, b"payload")
+    if r.status_code == 201:
+        stored = r.json()["stored_name"]
+        assert "/" not in stored and "\\" not in stored
+        assert not stored.startswith(".")
+        with core_client.for_creator(cfg, created_by=USER, roles=roles,
+                                     tenant=TENANT) as core:
+            assert stored in {e.name for e in core.client.dir(root)}
+    else:
+        assert r.status_code == 400
+
+
+def test_a_drop_requires_an_open_session(client, cfg, roles, tree):
+    root, _ = tree
+    link, secret = _drop_link(cfg, roles, root)
+    r = client.post(f"/share/v1/public/{link.link_uid}/files",
+                    headers=_h(secret, **{"X-File-Name": "x.txt"}), content=b"x")
+    assert r.status_code == 404
+
+
+def test_a_download_link_does_not_accept_drops(client, cfg, roles, tree, verified):
+    root, _ = tree
+    link, secret = _mint(cfg, roles, root)          # kind = 2
+    redemption = _open(client, link, secret, verified)
+    assert _drop(client, link, secret, redemption, "x.txt", b"x").status_code == 404
+
+
+def test_the_landing_prefix_quarantines_drops(client, cfg, roles, tree, verified):
+    root, _ = tree
+    link, secret = _drop_link(cfg, roles, root, landing_prefix="inbox")
+    redemption = _open(client, link, secret, verified)
+    assert _drop(client, link, secret, redemption, "note.txt", b"x").status_code == 201
+
+    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+        inbox = next(e for e in core.client.dir(root)
+                     if e.name == "inbox" and e.is_container)
+        assert "note.txt" in {e.name for e in core.client.dir(inbox.uid)}

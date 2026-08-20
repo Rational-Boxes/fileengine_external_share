@@ -195,6 +195,29 @@ def open_session(conn, cfg: Config, *, link_uid: str, verified_email: str,
                    members_served=len(frozen), members_omitted=omitted)
 
 
+def record_drop(conn, redemption_uid: str, link_uid: str, *, bytes_moved: int,
+                result_uid: str) -> None:
+    """Account for one delivered file on the session and the link.
+
+    `result_uid` is the last file the session produced -- the Share tab's "what
+    did they send us" link (spec §10.2). `files_moved` counts them all, and the
+    per-file audit event carries each one individually.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE share_redemptions
+                  SET bytes_moved = bytes_moved + %s,
+                      files_moved = files_moved + 1,
+                      result_uid = %s
+                WHERE redemption_uid = %s""",
+            (bytes_moved, result_uid, redemption_uid))
+        cur.execute(
+            """UPDATE share_links SET bytes_consumed = bytes_consumed + %s
+                WHERE link_uid = %s""",
+            (bytes_moved, link_uid))
+    conn.commit()
+
+
 def close_session(conn, redemption_uid: str, *, bytes_moved: int = 0,
                   files_moved: int = 0, result_uid: Optional[str] = None) -> None:
     """Mark the session finished and roll its totals onto the link."""

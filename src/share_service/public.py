@@ -59,7 +59,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import archive, db, links, otp_client, preflight, sessions
+from . import archive, db, drops, links, otp_client, preflight, sessions
 from . import snapshot as snapshot_mod
 from .audit import AuditUnavailable, get_emitter
 from .auth import client_addr
@@ -74,6 +74,11 @@ router = APIRouter(prefix="/share/v1/public")
 
 # The one response an outside caller ever gets when anything is wrong.
 _NOT_FOUND = {"error": "not_found"}
+
+# Starlette renamed this constant; support both so the module works either side
+# of the rename rather than emitting a deprecation warning on a hot path.
+_HTTP_413 = getattr(status, "HTTP_413_CONTENT_TOO_LARGE",
+                    status.HTTP_413_REQUEST_ENTITY_TOO_LARGE)
 
 # Set on every response from this router, including errors (spec §8.3).
 _HARDENING = {
@@ -459,6 +464,116 @@ def _require_session(conn, link_uid: str, redemption_uid: Optional[str]) -> dict
     return {"redemption_uid": str(row[0]), "verified_email": row[1],
             "frozen_members": [str(u) for u in (row[2] or [])],
             "archive_bytes": row[3]}
+
+
+@router.post("/{link_uid}/files", status_code=status.HTTP_201_CREATED)
+async def drop_file(link_uid: str, request: Request, k: Optional[str] = None,
+                    x_share_secret: Optional[str] = Header(default=None),
+                    x_redemption_uid: Optional[str] = Header(default=None),
+                    x_file_name: Optional[str] = Header(default=None),
+                    x_claimed_name: Optional[str] = Header(default=None)) -> Response:
+    """Drop one file into the link's folder. Requires an open session.
+
+    Consumes a **file slot**, not a use — a use was already spent opening the
+    session, and one sender may deliver several files across it (spec §6.4).
+    The slot is reserved before any bytes are stored and released if the store
+    fails, so an aborted upload costs the sender nothing.
+    """
+    cfg, tenant, conn, link = _resolve(request, link_uid, x_share_secret or k)
+    addr = client_addr(request)
+    reserved = False
+    try:
+        session = _require_session(conn, link_uid, x_redemption_uid)
+        if link.kind != KIND_UPLOAD:
+            raise _deny()
+
+        try:
+            name = drops.safe_filename(x_file_name or "")
+        except drops.DropRefused as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, {"error": e.reason})
+        if not drops.extension_allowed(name, link.ext_allowlist):
+            _audit_denied(cfg, link_uid=link_uid, reason="extension_not_allowed",
+                          tenant=tenant, addr=addr,
+                          email=session["verified_email"])
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                {"error": "extension_not_allowed",
+                                 "allowed": link.ext_allowlist})
+
+        # Reserve BEFORE reading the body: an exhausted link fails fast, and two
+        # concurrent drops cannot both take the last slot.
+        if not drops.reserve_slot(conn, link_uid):
+            _audit_denied(cfg, link_uid=link_uid, reason="file_budget_spent",
+                          tenant=tenant, addr=addr, email=session["verified_email"])
+            raise HTTPException(status.HTTP_409_CONFLICT,
+                                {"error": "no_files_remaining"})
+        reserved = True
+
+        cap = drops.effective_file_cap(cfg, link.max_file_bytes)
+        budget = drops.remaining_bytes(link)
+        if budget is not None:
+            cap = min(cap, budget)
+
+        # Read with the cap enforced as we go, so a hostile body is refused at
+        # the cap rather than after it has all arrived.
+        payload = bytearray()
+        async for chunk in request.stream():
+            payload.extend(chunk)
+            if len(payload) > cap:
+                _audit_denied(cfg, link_uid=link_uid, reason="file_too_large",
+                              tenant=tenant, addr=addr,
+                              email=session["verified_email"])
+                raise HTTPException(_HTTP_413,
+                                    {"error": "file_too_large", "max_bytes": cap})
+        if not payload:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, {"error": "empty_file"})
+
+        roles = _live_creator_roles(cfg, link)
+        provenance = {
+            "share.link_uid": link_uid,
+            "share.redemption_uid": session["redemption_uid"],
+            "share.source_addr": addr,
+            "share.verified_email": session["verified_email"],
+            # Sender-typed free text. UNTRUSTED -- the UI must render it as such
+            # (spec §6.8); the verified address beside it is the trustworthy half.
+            "share.claimed_name": (x_claimed_name or "")[:200] or None,
+        }
+        with for_creator(cfg, created_by=link.created_by, roles=roles,
+                         tenant=tenant, source_addr=addr,
+                         redemption_uid=session["redemption_uid"]) as core:
+            result = drops.store(core, folder_uid=link.resource_uid, name=name,
+                                 payload=bytes(payload),
+                                 landing_prefix=link.landing_prefix,
+                                 provenance=provenance)
+
+        sessions.record_drop(conn, session["redemption_uid"], link_uid,
+                             bytes_moved=result.size_bytes,
+                             result_uid=result.file_uid)
+        reserved = False          # committed: the slot is now genuinely spent
+
+        get_emitter(cfg).emit(
+            action="share_link_redeem", outcome="ok", category="mutate",
+            actor=f"share:{link_uid}|{session['verified_email']}", tenant=tenant,
+            target_uid=result.file_uid, source_addr=addr,
+            request_id=session["redemption_uid"],
+            detail={"link_uid": link_uid, "created_by": link.created_by,
+                    "verified_email": session["verified_email"],
+                    "stored_name": result.stored_name,
+                    "size_bytes": result.size_bytes})
+
+        # The sender is told what it was actually stored as, since a collision
+        # renames it -- otherwise "did my file arrive?" has no answer.
+        return _json({"stored_name": result.stored_name,
+                      "size_bytes": result.size_bytes},
+                     status_code=status.HTTP_201_CREATED)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001 - never leak an internal error outward
+        log.error("drop failed on %s: %s", link_uid, e, exc_info=True)
+        raise _deny()
+    finally:
+        if reserved:
+            drops.release_slot(conn, link_uid)
+        conn.close()
 
 
 @router.get("/{link_uid}/content")
