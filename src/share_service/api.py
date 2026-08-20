@@ -1,0 +1,735 @@
+# Copyright (C) 2026 James Hickman
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Owner-side routes — bearer-authenticated (spec §7.1).
+
+Every route here requires a caller token by construction: the dependency is on
+the router, not on individual handlers, so a new route inherits the gate or does
+not ship. The unauthenticated public router (M4) will be a **separate** router
+with different dependencies — never an allowlisted exception inside this one,
+which is the pattern that made the bridge's auth gate one forgotten `else` away
+from exposure (spec §7).
+
+Note what is absent: no route takes a resource uid for an *existing* link. The
+target is always read from the stored row (spec §4.3). That containment used to
+be the core's job.
+"""
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from typing import Any, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import BaseModel, Field
+
+from . import core_client, db, links, preflight, snapshot as snapshot_mod
+from .audit import AuditUnavailable, get_emitter
+from .auth import Caller, get_caller
+from .config import Config
+from .ldap_roles import LdapUnavailable, UnknownUser, in_share_group
+from .schema import KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD, KIND_UPLOAD, KINDS
+
+log = logging.getLogger("share_service.api")
+
+router = APIRouter(prefix="/share/v1", dependencies=[Depends(get_caller)])
+
+
+# --- request / response models -------------------------------------------
+
+class CreateLinkRequest(BaseModel):
+    """Note there is no `resource_uid`: the target comes from the path, and for
+    every later call from the stored row. Nor a `send_invite`: v1 sends no
+    invite mail — the creator composes their own (spec §13-R9)."""
+    kind: int = Field(..., description="0 file download, 1 upload, 2 folder download")
+    recipients: List[str] = Field(..., min_length=1)
+    expires_at: Optional[datetime] = None
+    ttl_days: Optional[int] = None
+    max_uses: int = 0
+    max_uses_per_recipient: int = 0
+    max_bytes: int = 0
+    max_file_bytes: int = 0
+    max_files: int = Field(0, description="upload only: total files, NOT sessions (spec §6.4)")
+    follow_latest: bool = False
+    follow_folder: bool = False
+    include_subdirs: bool = True
+    landing_prefix: Optional[str] = None
+    ext_allowlist: Optional[List[str]] = None
+    note: Optional[str] = None
+
+
+class AddRecipientRequest(BaseModel):
+    email: str
+
+
+def _link_json(link: links.Link, *, status_override: Optional[str] = None) -> dict:
+    return {
+        "link_uid": link.link_uid,
+        "kind": link.kind,
+        "resource_uid": link.resource_uid,
+        "created_by": link.created_by,
+        "created_at": link.created_at,
+        "expires_at": link.expires_at,
+        "revoked_at": link.revoked_at,
+        "revoked_by": link.revoked_by,
+        "status": status_override or link.status(),
+        "max_uses": link.max_uses,
+        "uses_consumed": link.uses_consumed,
+        "max_uses_per_recipient": link.max_uses_per_recipient,
+        "max_bytes": link.max_bytes,
+        "bytes_consumed": link.bytes_consumed,
+        "max_file_bytes": link.max_file_bytes,
+        "max_files": link.max_files,
+        "files_consumed": link.files_consumed,
+        "pinned_version": link.pinned_version,
+        "follow_folder": link.follow_folder,
+        "include_subdirs": link.include_subdirs,
+        "archive_bytes": link.archive_bytes,
+        "note": link.note,
+        # Never the secret. It existed once, in the creation response.
+    }
+
+
+# --- helpers --------------------------------------------------------------
+
+def _config(request: Request) -> Config:
+    return request.app.state.config
+
+def _require_enabled(cfg: Config) -> None:
+    emitter = get_emitter(cfg)
+    if not cfg.enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "share links are disabled here")
+    if not emitter.available:
+        # Auditing off means sharing off (spec §4.3): the audit chain is the
+        # only record that an access was external.
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "audit unavailable; share links refuse to operate")
+
+
+def is_tenant_admin(cfg: Config, caller: Caller) -> bool:
+    """Whether this caller may use the oversight console (spec §10.3).
+
+    Read from the roles the bridge put in the signed token, scoped to the ACTIVE
+    tenant by `identity_from_claims` — so an administrator of tenant A is an
+    ordinary user in tenant B, and switching tenants cannot carry the power
+    across.
+
+    NB this deliberately does NOT go through `ldap_roles.resolve_share_roles`,
+    which strips exactly these roles. That stripping governs what this service
+    hands the CORE on a delegated call, where an admin role would become an ACL
+    bypass on behalf of an absent creator. Asking "may this human open the
+    console?" is the opposite question, and answering it from the stripped list
+    would make the console permanently empty for everyone.
+    """
+    return any(caller.has_role(r) for r in cfg.admin_roles)
+
+
+def _require_admin(cfg: Config, caller: Caller) -> None:
+    if not is_tenant_admin(cfg, caller):
+        # 403, not 404: unlike a link uid, the existence of the console is not
+        # a secret, and a silent empty list would read as "nothing is shared".
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "tenant administrator role required")
+
+
+def _owned_link(conn, link_uid: str, caller: Caller,
+                cfg: Optional[Config] = None) -> links.Link:
+    """Fetch a link the caller may act on, or 404.
+
+    404 rather than 403 for someone else's link: whether a link exists is not
+    something an unrelated user should be able to probe.
+
+    A tenant admin may act on any link in their tenant — but only when `cfg` is
+    passed, so admin reach is something a route opts INTO rather than something
+    every existing caller of this helper silently inherits.
+    """
+    try:
+        link = links.get(conn, link_uid)
+    except links.LinkNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "not_found")
+    if link.created_by != caller.user:
+        if cfg is None or not is_tenant_admin(cfg, caller):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "not_found")
+    return link
+
+
+class RevokeAllRequest(BaseModel):
+    creator: str
+
+
+def _public_url(cfg: Config, request: Request, link_uid: str, secret: str) -> str:
+    base = cfg.public_base_url or str(request.base_url).rstrip("/")
+    return f"{base.rstrip('/')}/s/{link_uid}.{secret}"
+
+
+# --- routes ---------------------------------------------------------------
+
+@router.post("/nodes/{resource_uid}/links", status_code=status.HTTP_201_CREATED)
+def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
+                caller: Caller = Depends(get_caller)) -> dict:
+    """Mint a link. The response carries the only copy of the secret."""
+    cfg = _config(request)
+    _require_enabled(cfg)
+
+    if body.kind not in KINDS:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"unknown kind {body.kind}")
+
+    # --- gate 1 (per-user): the share_external LDAP group (spec §8.1) ------
+    try:
+        if not in_share_group(cfg, caller.user):
+            raise HTTPException(status.HTTP_403_FORBIDDEN,
+                                "you are not permitted to create outside share links")
+    except UnknownUser:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "unknown user")
+    except LdapUnavailable:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "directory unavailable; cannot confirm permissions")
+
+    # --- recipients + expiry ----------------------------------------------
+    emails: list[str] = []
+    for raw in body.recipients:
+        e = links.normalize_email(raw)
+        if e and e not in emails:
+            emails.append(e)
+    if not emails:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "at least one recipient is required")
+    if len(emails) > cfg.max_recipients:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            f"at most {cfg.max_recipients} recipients")
+    try:
+        expires_at = links.clamp_expiry(cfg, body.expires_at, body.ttl_days)
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+
+    if cfg.max_uses_cap and (body.max_uses == 0 or body.max_uses > cfg.max_uses_cap):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            f"max_uses must be between 1 and {cfg.max_uses_cap}")
+
+    # --- gate 2 (per-resource) + the pre-flight ---------------------------
+    # These are the same check: the pre-flight runs exactly what a redemption
+    # will run, so a link that would be born dead is refused here (spec §6.3).
+    permission = core_client.WRITE if body.kind == KIND_UPLOAD else core_client.READ
+    result = preflight.check(cfg, created_by=caller.user, tenant=caller.tenant,
+                             resource_uid=resource_uid, permission=permission,
+                             source_addr=caller.source_addr)
+    if not result:
+        detail = {"error": result.reason, "message": preflight.creator_message(result)}
+        code = (status.HTTP_503_SERVICE_UNAVAILABLE
+                if result.reason == preflight.REASON_LDAP
+                else status.HTTP_403_FORBIDDEN)
+        raise HTTPException(code, detail)
+
+    # --- the kind must match the resource type, and (kind 2) the snapshot --
+    # Both need a delegated client, so they share one.
+    snap = None
+    pinned_version = None
+    file_bytes = None
+    depth = None
+    path = ""
+    try:
+        with core_client.for_creator(cfg, created_by=caller.user, roles=result.roles or [],
+                                     tenant=caller.tenant,
+                                     source_addr=caller.source_addr) as core:
+            is_dir = core.is_dir(resource_uid)
+            # Where this sits in the tree, captured once. The admin console
+            # sorts by it (spec §10.3) and cannot afford a core round-trip per
+            # row across a whole tenant.
+            depth, path = core.locate(resource_uid)
+            if not links.kind_matches_resource(body.kind, is_dir):
+                raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                    "kind does not match the resource type "
+                                    "(file for kind 0, folder for kinds 1 and 2)")
+            # A file link records the ENTITY UUID AND THE VERSION TIMESTAMP, so
+            # it keeps serving what it was minted for. Unpinned is the explicit
+            # opt-in: without this a document shared for review in March
+            # silently exposes whatever it becomes in September (spec §6.2).
+            if body.kind == KIND_FILE_DOWNLOAD:
+                # Recorded now, into the same column a folder link uses for its
+                # archive total, so /peek stays a pure DB read: that route is
+                # unauthenticated, and it must not turn an anonymous visitor
+                # into a delegated core call.
+                try:
+                    file_bytes = int(core.stat(resource_uid).size)
+                except Exception:  # noqa: BLE001
+                    file_bytes = None
+                if not body.follow_latest:
+                    pinned_version = core.current_version(resource_uid)
+                    if not pinned_version:
+                        raise HTTPException(
+                            status.HTTP_400_BAD_REQUEST,
+                            "this file has no saved version yet, so there is "
+                            "nothing to share")
+            # A folder-download link captures its members now (spec §6.5).
+            # `follow_folder` opts into live semantics and takes no snapshot.
+            if body.kind == KIND_FOLDER_DOWNLOAD and not body.follow_folder:
+                snap = snapshot_mod.walk(core, cfg, resource_uid,
+                                         include_subdirs=body.include_subdirs)
+    except HTTPException:
+        raise
+    except snapshot_mod.SnapshotTooLarge as e:
+        # Refused here, with the numbers, so the recipient never discovers the
+        # limit mid-download (spec §6.1).
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            {"error": "folder_too_large", "message": str(e),
+                             "members": e.members, "total_bytes": e.total_bytes,
+                             "max_members": cfg.zip_max_members,
+                             "max_bytes": cfg.zip_max_bytes})
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"core unavailable: {e}")
+
+    # --- mint --------------------------------------------------------------
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        link, secret = links.create(
+            conn, kind=body.kind, resource_uid=resource_uid, created_by=caller.user,
+            expires_at=expires_at, recipients=emails,
+            max_uses=body.max_uses, max_uses_per_recipient=body.max_uses_per_recipient,
+            max_bytes=body.max_bytes, max_file_bytes=body.max_file_bytes,
+            max_files=body.max_files or (cfg.upload_max_files if body.kind == KIND_UPLOAD else 0),
+            # Recorded in the cross-tenant directory too, so a recipient — who
+            # arrives with no tenant context at all — can be routed to the right
+            # schema. Without it a link outside the default tenant is unfindable.
+            tenant=caller.tenant,
+            pinned_version=pinned_version,
+            follow_folder=body.follow_folder, include_subdirs=body.include_subdirs,
+            landing_prefix=body.landing_prefix, ext_allowlist=body.ext_allowlist,
+            archive_bytes=file_bytes, resource_depth=depth, resource_path=path,
+            note=body.note)
+
+        if snap is not None:
+            snapshot_mod.store(conn, link.link_uid, snap)
+            link = links.get(conn, link.link_uid)
+
+        # Fail-closed: creation is a grant of access, so it does not stand if it
+        # cannot be recorded (spec §12).
+        try:
+            get_emitter(cfg).emit_or_raise(
+                action="share_link_create", outcome="ok", category="permission",
+                actor=caller.user, tenant=caller.tenant, target_uid=resource_uid,
+                source_addr=caller.source_addr, request_id=link.link_uid,
+                detail={"link_uid": link.link_uid, "kind": link.kind,
+                        "recipients": len(emails), "expires_at": expires_at.isoformat(),
+                        "max_uses": link.max_uses})
+        except AuditUnavailable:
+            links.revoke(conn, link.link_uid, revoked_by="system:audit-unavailable")
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                                "link not created: the audit record could not be written")
+    finally:
+        conn.close()
+
+    payload = _link_json(link)
+    payload["url"] = _public_url(cfg, request, link.link_uid, secret)
+    payload["secret_shown_once"] = True
+    if snap is not None:
+        # The numbers the creator pastes into their own email (spec §13-R9),
+        # and the ones that make the archive size a decision rather than a
+        # surprise on a phone.
+        payload["member_count"] = snap.file_count
+        payload["archive_bytes"] = snap.archive_bytes
+        payload["worst_case_egress_bytes"] = (
+            snap.archive_bytes * link.max_uses if link.max_uses else None)
+        if snap.skipped:
+            payload["skipped"] = snap.skipped
+    return payload
+
+
+@router.get("/nodes/{resource_uid}/links")
+def list_node_links(resource_uid: str, request: Request,
+                    caller: Caller = Depends(get_caller)) -> dict:
+    cfg = _config(request)
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        found = [l for l in links.list_for_resource(conn, resource_uid)
+                 if l.created_by == caller.user]
+    finally:
+        conn.close()
+    return {"links": [_link_json(l) for l in found]}
+
+
+@router.get("/links")
+def list_my_links(request: Request, live: bool = True, all: bool = False,
+                  creator: str = "", recipient: str = "", subtree: str = "",
+                  status_filter: str = Query("", alias="status"),
+                  caller: Caller = Depends(get_caller)) -> dict:
+    """The caller's own links, or — with `all=true` and the admin role — the
+    tenant-wide oversight view (spec §10.3).
+
+    One route rather than two because the shape is identical and the ONLY
+    difference is scope; a separate /admin/links would invite the two to drift
+    into disagreeing about what "expired" means.
+    """
+    cfg = _config(request)
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        if not all:
+            found = links.list_for_creator(conn, caller.user, live_only=live)
+            return {"links": [_link_json(l) for l in found]}
+
+        _require_admin(cfg, caller)
+        rows = links.list_for_tenant(
+            conn, live_only=live, creator=creator, recipient=recipient,
+            subtree=subtree, status=status_filter)
+    finally:
+        conn.close()
+
+    return {"links": [
+        # The extra columns exist only on this view. `creator` is the
+        # departed-employee query's pivot, so it is first-class here while the
+        # owner-side view has no use for it.
+        {**_link_json(r["link"]),
+         "creator": r["link"].created_by,
+         "recipient_count": r["recipient_count"],
+         "last_activity": r["last_activity"],
+         "resource_path": r["link"].resource_path,
+         "resource_depth": r["link"].resource_depth}
+        for r in rows],
+        "scope": "tenant",
+        # Surfaced, never silent: see links.list_for_tenant.
+        "truncated": bool(rows and rows[0].get("truncated"))}
+
+
+class ProvenanceRequest(BaseModel):
+    file_uids: List[str] = Field(default_factory=list)
+
+
+@router.post("/files/provenance")
+def file_provenance(body: ProvenanceRequest, request: Request,
+                    caller: Caller = Depends(get_caller)) -> dict:
+    """Batch: which of these files came from outside, and from whom.
+
+    Answers the file list's "this was dropped by someone external" marker in one
+    query per page. Read from the redemption ledger, NOT from the core's
+    `share.*` metadata: the core reserves no namespace there, so anyone with
+    WRITE can rewrite those keys, which disqualifies them as evidence. The
+    ledger mirrors the audit chain, which is the source of truth and outlives
+    these rows when retention prunes them.
+
+    Keyed on the file uid, so a move or rename does not lose the marker.
+
+    **ACL-filtered as the CALLER** — the one place this service asks the core a
+    question as the caller rather than delegating as a link creator.
+
+    Be clear about how strong that filter is: the core is read-by-default, so an
+    unrelated signed-in user can reach most files and will see the marker too.
+    That is the intended posture, not a hole — if you may read the file, knowing
+    it came from outside is not an escalation, and it is exactly what a
+    colleague browsing the folder needs to know. What the filter genuinely stops
+    is answering for uids the caller cannot reach AT ALL: deleted resources, and
+    anything under an explicit DENY.
+
+    Batched over one connection, and only files that actually have provenance
+    reach the core — the common case (no drops on the page) costs nothing.
+    """
+    cfg = _config(request)
+    uids = [u for u in dict.fromkeys(body.file_uids) if u][:cfg.provenance_batch_max]
+    if not uids:
+        return {"provenance": {}}
+
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        found = links.provenance_for_files(conn, uids)
+    finally:
+        conn.close()
+    if not found:
+        return {"provenance": {}}
+
+    visible = {}
+    try:
+        with core_client.for_creator(cfg, created_by=caller.user,
+                                     roles=list(caller.roles), tenant=caller.tenant,
+                                     source_addr=caller.source_addr) as core:
+            for uid, row in found.items():
+                # can_reach, not check_permission: read-by-default means a
+                # missing uid PASSES a bare permission check, so existence has
+                # to be part of the question (spec §6.3).
+                if core.can_reach(uid):
+                    visible[uid] = row
+    except Exception as e:  # noqa: BLE001 - unable to check means show nothing
+        log.warning("provenance ACL check failed for %s: %s", caller.user, e)
+        return {"provenance": {}}
+
+    return {"provenance": {
+        uid: {"email": r["email"], "at": r["at"], "shared_by": r["shared_by"]}
+        for uid, r in visible.items()}}
+
+
+@router.get("/links/mine/inbox")
+def sharing_inbox(request: Request,
+                  caller: Caller = Depends(get_caller)) -> dict:
+    """The Dashboard's Sharing panel: "what have I got open right now" (§10.6).
+
+    Grouped rather than flat, because the three groups want different reactions:
+    something is wrong, something arrived, and everything else is fine.
+
+    This is ALSO where "your link stopped working" is detected. That state has no
+    triggering event — nothing happens when an ACL three folders up is edited —
+    so rather than build a watcher, the pre-flight is evaluated here, bounded by
+    the caller's own live-link count. A link that is dead but unnoticed costs
+    nothing until someone looks, and this is the moment someone looks.
+    """
+    cfg = _config(request)
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        live = links.list_for_creator(conn, caller.user, live_only=True)
+        counts = {l.link_uid: links.count_recipients(conn, l.link_uid) for l in live}
+    finally:
+        conn.close()
+
+    # Per LINK, not once for the caller: the most common way a link dies is an
+    # ACL change on its own resource, so one answer for the whole set would miss
+    # exactly the case this exists to catch. check_many resolves the creator's
+    # LDAP roles once and shares a single core connection, so the cost is one
+    # directory round-trip plus one gRPC call per link rather than N of each.
+    verdicts = preflight.check_many(
+        cfg, created_by=caller.user, tenant=caller.tenant,
+        targets=[(l.link_uid, l.resource_uid, l.pinned_version or "") for l in live],
+        source_addr=caller.source_addr)
+
+    needs, drops_, active = [], [], []
+    for l in live:
+        row = _link_json(l)
+        row["recipient_count"] = counts.get(l.link_uid, 0)
+        verdict = verdicts.get(l.link_uid)
+        if verdict is not None and not verdict.ok:
+            row["status"] = "not_working"
+            row["not_working_reason"] = verdict.reason
+            row["not_working_message"] = preflight.creator_message(verdict)
+        if row["status"] == "not_working" or l.status() == "blocked":
+            needs.append(row)
+        elif l.kind == KIND_UPLOAD:
+            drops_.append(row)
+        else:
+            active.append(row)
+
+    # "Needs attention" is empty most days, and that emptiness is the point.
+    return {"needs_attention": needs, "drop_boxes": drops_, "active": active}
+
+
+@router.post("/admin/revoke-all")
+def admin_revoke_all(body: RevokeAllRequest, request: Request,
+                     caller: Caller = Depends(get_caller)) -> dict:
+    """End every live link one creator left open — the departed-employee action.
+
+    Audited one event per link, with the acting ADMIN as actor and the creator
+    recorded in the detail. A single "revoked 14 links" event is not a record
+    anyone can later answer questions from, and the person who pushed the button
+    is the fact an oversight trail most needs.
+    """
+    cfg = _config(request)
+    _require_admin(cfg, caller)
+    target = (body.creator or "").strip()
+    if not target:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "creator is required")
+
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        # Read the rows BEFORE revoking: the audit event wants each link's
+        # resource_uid, and after the update they no longer match "live".
+        doomed = {r["link"].link_uid: r["link"]
+                  for r in links.list_for_tenant(conn, live_only=True,
+                                                 creator=target, limit=10000)}
+        revoked = links.revoke_all_for_creator(conn, target, caller.user)
+    finally:
+        conn.close()
+
+    unaudited = []
+    for uid in revoked:
+        link = doomed.get(uid)
+        try:
+            get_emitter(cfg).emit_or_raise(
+                action="share_link_revoke", outcome="ok", category="permission",
+                actor=caller.user, tenant=caller.tenant,
+                target_uid=link.resource_uid if link else "",
+                source_addr=caller.source_addr, request_id=uid,
+                detail={"link_uid": uid, "creator": target,
+                        "by": "admin_revoke_all"})
+        except AuditUnavailable:
+            unaudited.append(uid)
+
+    if unaudited:
+        # Same rule as the single revoke: the safe direction already happened,
+        # so report the gap loudly rather than rolling access back open.
+        log.error("admin_revoke_all NOT audited for %s", unaudited)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            f"{len(revoked)} links revoked, but {len(unaudited)} "
+                            "audit records could not be written — report this")
+    return {"creator": target, "revoked": len(revoked), "link_uids": revoked}
+
+
+@router.get("/links/{link_uid}")
+def get_link(link_uid: str, request: Request,
+             caller: Caller = Depends(get_caller)) -> dict:
+    """One link's live status — including the re-run pre-flight.
+
+    This is what surfaces "not working: you no longer have access" (spec
+    §10.2). A link can stop working with nothing about the link having changed,
+    and without this the creator's experience is "my recipient says it's broken
+    and everything looks fine to me".
+    """
+    cfg = _config(request)
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        link = _owned_link(conn, link_uid, caller, cfg)
+    finally:
+        conn.close()
+
+    payload = _link_json(link)
+    if link.status() == "active":
+        permission = core_client.WRITE if link.kind == KIND_UPLOAD else core_client.READ
+        result = preflight.check(cfg, created_by=link.created_by, tenant=caller.tenant,
+                                 resource_uid=link.resource_uid, permission=permission,
+                                 pinned_version=link.pinned_version or "",
+                                 source_addr=caller.source_addr)
+        if not result:
+            payload["status"] = "not_working"
+            payload["not_working_reason"] = result.reason
+            payload["not_working_message"] = preflight.creator_message(result)
+    return payload
+
+
+@router.delete("/links/{link_uid}")
+def revoke_link(link_uid: str, request: Request,
+                caller: Caller = Depends(get_caller)) -> dict:
+    """Revoke. Idempotent — revoking an already-revoked link is a success."""
+    cfg = _config(request)
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        # cfg passed => a tenant admin may revoke someone else's link. This is
+        # the ONE power the console adds; it cannot mint, cannot re-send (the
+        # plaintext secret does not exist server-side), and cannot read content.
+        link = _owned_link(conn, link_uid, caller, cfg)
+        changed = links.revoke(conn, link_uid, caller.user)
+    finally:
+        conn.close()
+    on_behalf = link.created_by != caller.user
+
+    if changed:
+        try:
+            get_emitter(cfg).emit_or_raise(
+                action="share_link_revoke", outcome="ok", category="permission",
+                actor=caller.user, tenant=caller.tenant, target_uid=link.resource_uid,
+                source_addr=caller.source_addr, request_id=link_uid,
+                detail={"link_uid": link_uid,
+                        **({"creator": link.created_by, "by": "admin"}
+                           if on_behalf else {})})
+        except AuditUnavailable:
+            # The revocation already happened and is the safe direction; do not
+            # roll it back over an audit failure. Report the gap loudly instead.
+            log.error("share_link_revoke NOT audited for %s", link_uid)
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                                "link revoked, but the audit record could not be "
+                                "written — report this")
+    return {"link_uid": link_uid, "revoked": True, "changed": changed}
+
+
+@router.get("/links/{link_uid}/recipients")
+def list_recipients(link_uid: str, request: Request, include_removed: bool = False,
+                    caller: Caller = Depends(get_caller)) -> dict:
+    cfg = _config(request)
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        _owned_link(conn, link_uid, caller, cfg)
+        roster = links.recipients(conn, link_uid, include_removed=include_removed)
+    finally:
+        conn.close()
+    return {"recipients": roster}
+
+
+@router.get("/links/{link_uid}/redemptions")
+def list_redemptions(link_uid: str, request: Request, limit: int = 200,
+                     caller: Caller = Depends(get_caller)) -> dict:
+    """The link's usage ledger (spec §7.1).
+
+    Read from this service's own rows rather than from the audit log, so an
+    ordinary creator can see who used their link without holding an AUDIT_READ
+    scope. The full forensic trail stays in `audit_service` for anyone who does.
+    """
+    cfg = _config(request)
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        _owned_link(conn, link_uid, caller, cfg)
+        return {"redemptions": links.redemptions(conn, link_uid, limit=min(limit, 500))}
+    finally:
+        conn.close()
+
+
+@router.post("/links/{link_uid}/recipients", status_code=status.HTTP_201_CREATED)
+def add_recipient(link_uid: str, body: AddRecipientRequest, request: Request,
+                  caller: Caller = Depends(get_caller)) -> dict:
+    """Extend the allowlist after the fact. An outside caller never can (spec
+    §6.9); this is audited as a permission change because it widens who can
+    reach the resource."""
+    cfg = _config(request)
+    _require_enabled(cfg)
+    email = links.normalize_email(body.email)
+    if not email:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "email required")
+
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        # No `cfg` here, deliberately: an admin must not widen someone else's
+        # link. Console powers stop at revocation (spec §10.3) - adding an
+        # address is a grant of access, the direction oversight is meant to
+        # close, not open.
+        _owned_link(conn, link_uid, caller)
+        if links.count_recipients(conn, link_uid) >= cfg.max_recipients:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                f"at most {cfg.max_recipients} recipients")
+        links.add_recipient(conn, link_uid, email, caller.user)
+    finally:
+        conn.close()
+
+    try:
+        get_emitter(cfg).emit_or_raise(
+            action="share_link_recipient_add", outcome="ok", category="permission",
+            actor=caller.user, tenant=caller.tenant, source_addr=caller.source_addr,
+            request_id=link_uid, detail={"link_uid": link_uid, "email": email})
+    except AuditUnavailable:
+        links.remove_recipient(conn := db.connect_for_tenant(cfg, caller.tenant),
+                               link_uid, email, "system:audit-unavailable")
+        conn.close()
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "recipient not added: the audit record could not be written")
+    return {"link_uid": link_uid, "email": email}
+
+
+@router.delete("/links/{link_uid}/recipients/{email}")
+def remove_recipient(link_uid: str, email: str, request: Request,
+                     caller: Caller = Depends(get_caller)) -> dict:
+    """Partial revoke — cheaper than revoking and re-issuing, which would
+    invalidate the URL for everyone who already has it (spec §10.2)."""
+    cfg = _config(request)
+    normalized = links.normalize_email(email)
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        _owned_link(conn, link_uid, caller, cfg)
+        changed = links.remove_recipient(conn, link_uid, normalized, caller.user)
+    finally:
+        conn.close()
+
+    if changed:
+        try:
+            get_emitter(cfg).emit_or_raise(
+                action="share_link_recipient_remove", outcome="ok",
+                category="permission", actor=caller.user, tenant=caller.tenant,
+                source_addr=caller.source_addr, request_id=link_uid,
+                detail={"link_uid": link_uid, "email": normalized})
+        except AuditUnavailable:
+            log.error("share_link_recipient_remove NOT audited for %s/%s",
+                      link_uid, normalized)
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                                "recipient removed, but the audit record could not "
+                                "be written — report this")
+    return {"link_uid": link_uid, "email": normalized, "removed": True, "changed": changed}

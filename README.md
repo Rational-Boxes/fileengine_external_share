@@ -1,8 +1,11 @@
 # share_service
 
-> ⚠️ **Design stage — no implementation yet.** This repository currently holds the
-> specification only. See
-> [`design_documents/OUTSIDE_SHARE_LINKS.md`](design_documents/OUTSIDE_SHARE_LINKS.md).
+> **M0 complete** (2026-08-20) — an authenticated user can mint, list and revoke
+> links, and every rule that will govern redemption is implemented and tested.
+> No public door yet: nothing here is reachable without a bearer token. See
+> [`DEVELOPMENT_PLAN.md`](DEVELOPMENT_PLAN.md) for what M0 covered and
+> [`design_documents/OUTSIDE_SHARE_LINKS.md`](design_documents/OUTSIDE_SHARE_LINKS.md)
+> for the specification.
 
 FastAPI microservice for **outside share links** — time- and count-limited URLs
 that let someone with no FileEngine account download a file, download a folder as
@@ -55,9 +58,23 @@ Structurally a sibling of `folder_actions` / `difference_service`: reused
 `fileengine` gRPC client, LDAP→bearer auth, `FILEENGINE_*` shared config with
 `SHARE_*` private knobs.
 
+## Running it
+
+```bash
+pip install ../python_interface ../audit_service .   # sibling packages
+cp .env.example .env                                 # fill in the shared secrets
+share-service                                        # API :8101, monitoring :8102
+PYTHONPATH=src pytest src/tests                      # add -m live for integration
+./tools/check-core-untouched.sh                      # M0's acceptance criterion
+```
+
+`FILEENGINE_AUDIT_ENABLED=false` does not quietly disable the recording — it
+disables the feature. Without a reachable audit stream nothing external would be
+recorded as external, so `/readyz` stays red and the routes refuse.
+
 ## Status
 
 The specification is complete and has no open design questions — §13 records
 decisions R1–R13, including the ones that reversed earlier positions. §14 lists
-the implementation milestones; M0's acceptance criterion is an **empty diff
-against `file_engine_core`**.
+the milestones. **M0 is done**; M1 (folder snapshots) is next, and M4 is where
+an unauthenticated door first exists and earns its own security review.
