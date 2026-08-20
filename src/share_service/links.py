@@ -344,6 +344,40 @@ def list_for_tenant(conn, *, live_only: bool = True, creator: str = "",
     return out
 
 
+def provenance_for_files(conn, file_uids) -> dict:
+    """Which of these files arrived from outside, and from whom.
+
+    One indexed query for a whole file-list page — the alternative is reading
+    metadata per row, which is both N core round-trips and, more importantly,
+    NOT EVIDENCE: the core reserves no `share.*` namespace, so anyone with WRITE
+    can rewrite those keys. This ledger mirrors the audit chain instead.
+
+    Keyed on the file uid, so the marker survives a move or a rename.
+
+    `claimed_name` is sender-typed free text and stays UNTRUSTED all the way to
+    the UI; `email` beside it is the verified half and is the one to believe.
+    """
+    uids = [u for u in dict.fromkeys(file_uids) if u]
+    if not uids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT d.result_uid, d.verified_email, d.opened_at, d.link_uid,
+                      l.created_by
+                 FROM share_redemptions d
+                 JOIN share_links l ON l.link_uid = d.link_uid
+                WHERE d.result_uid = ANY(%s::uuid[])""",
+            (uids,))
+        rows = cur.fetchall()
+    return {
+        # Stringified at the boundary: psycopg returns UUID objects here while
+        # the caller's uids are strings, and a mismatch silently matches nothing.
+        str(r[0]): {"email": r[1], "at": r[2], "link_uid": str(r[3]),
+                    "shared_by": r[4]}
+        for r in rows
+    }
+
+
 def revoke_all_for_creator(conn, created_by: str, revoked_by: str) -> List[str]:
     """The departed-employee action: end every live link one person left open.
 

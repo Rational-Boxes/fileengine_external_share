@@ -396,6 +396,71 @@ def list_my_links(request: Request, live: bool = True, all: bool = False,
         "truncated": bool(rows and rows[0].get("truncated"))}
 
 
+class ProvenanceRequest(BaseModel):
+    file_uids: List[str] = Field(default_factory=list)
+
+
+@router.post("/files/provenance")
+def file_provenance(body: ProvenanceRequest, request: Request,
+                    caller: Caller = Depends(get_caller)) -> dict:
+    """Batch: which of these files came from outside, and from whom.
+
+    Answers the file list's "this was dropped by someone external" marker in one
+    query per page. Read from the redemption ledger, NOT from the core's
+    `share.*` metadata: the core reserves no namespace there, so anyone with
+    WRITE can rewrite those keys, which disqualifies them as evidence. The
+    ledger mirrors the audit chain, which is the source of truth and outlives
+    these rows when retention prunes them.
+
+    Keyed on the file uid, so a move or rename does not lose the marker.
+
+    **ACL-filtered as the CALLER** — the one place this service asks the core a
+    question as the caller rather than delegating as a link creator.
+
+    Be clear about how strong that filter is: the core is read-by-default, so an
+    unrelated signed-in user can reach most files and will see the marker too.
+    That is the intended posture, not a hole — if you may read the file, knowing
+    it came from outside is not an escalation, and it is exactly what a
+    colleague browsing the folder needs to know. What the filter genuinely stops
+    is answering for uids the caller cannot reach AT ALL: deleted resources, and
+    anything under an explicit DENY.
+
+    Batched over one connection, and only files that actually have provenance
+    reach the core — the common case (no drops on the page) costs nothing.
+    """
+    cfg = _config(request)
+    uids = [u for u in dict.fromkeys(body.file_uids) if u][:cfg.provenance_batch_max]
+    if not uids:
+        return {"provenance": {}}
+
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        found = links.provenance_for_files(conn, uids)
+    finally:
+        conn.close()
+    if not found:
+        return {"provenance": {}}
+
+    visible = {}
+    try:
+        with core_client.for_creator(cfg, created_by=caller.user,
+                                     roles=list(caller.roles), tenant=caller.tenant,
+                                     source_addr=caller.source_addr) as core:
+            for uid, row in found.items():
+                # can_reach, not check_permission: read-by-default means a
+                # missing uid PASSES a bare permission check, so existence has
+                # to be part of the question (spec §6.3).
+                if core.can_reach(uid):
+                    visible[uid] = row
+    except Exception as e:  # noqa: BLE001 - unable to check means show nothing
+        log.warning("provenance ACL check failed for %s: %s", caller.user, e)
+        return {"provenance": {}}
+
+    return {"provenance": {
+        uid: {"email": r["email"], "at": r["at"], "shared_by": r["shared_by"]}
+        for uid, r in visible.items()}}
+
+
 @router.get("/links/mine/inbox")
 def sharing_inbox(request: Request,
                   caller: Caller = Depends(get_caller)) -> dict:

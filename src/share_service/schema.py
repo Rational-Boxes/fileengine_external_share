@@ -150,6 +150,18 @@ def _ddl(schema: str) -> list[str]:
         );
         """,
         f"CREATE INDEX IF NOT EXISTS share_redemptions_link ON {s}.share_redemptions (link_uid, opened_at DESC);",
+        # "Was this file dropped from outside, and by whom?", asked once per
+        # file-list page. Keyed on the file UID, so the answer survives a move
+        # or a rename -- a path-keyed marker would not.
+        #
+        # This ledger, not the core's share.* metadata, is what the UI reads.
+        # Those metadata keys are a convenience copy for anyone inspecting the
+        # file directly: the core reserves no namespace, so ANYONE WITH WRITE
+        # CAN REWRITE THEM, which disqualifies them as evidence. This table
+        # mirrors the audit chain, which is the actual source of truth and
+        # outlives these rows when retention prunes them (spec §5.5).
+        f"CREATE INDEX IF NOT EXISTS share_redemptions_result ON {s}.share_redemptions (result_uid) "
+        f"    WHERE result_uid IS NOT NULL;",
 
         # --- share_link_recipients (spec §5.4) ------------------------------
         # The closed destination set. PII in a tenant schema -- never logged,

@@ -143,6 +143,10 @@ class Config:
         self.events_stream = _env("FILEENGINE_EVENTS_STREAM", "fileengine:events")
         # budget_exhausted / expiry_soon are available and OFF by default —
         # they are the two most likely to become noise (spec §9).
+        # How many uids one file-list page may ask about. A cap, not a page
+        # size: the SPA sends what it is showing, and this bounds the ACL work
+        # a single request can ask the core to do.
+        self.provenance_batch_max = _int("SHARE_PROVENANCE_BATCH_MAX", 200)
         self.attention_events = tuple(
             e.strip() for e in
             _env("SHARE_ATTENTION_EVENTS",

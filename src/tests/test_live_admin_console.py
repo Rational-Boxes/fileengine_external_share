@@ -107,6 +107,18 @@ def real_folder(cfg) -> str:
     pytest.skip("no directory available in the dev core")
 
 
+def _real_file(cfg, folder_uid: str) -> str:
+    """A file that genuinely exists in the core, so the ACL check can pass."""
+    from share_service import core_client, ldap_roles
+    roles = ldap_roles.resolve_share_roles(cfg, ADMIN)
+    with core_client.for_creator(cfg, created_by=ADMIN, roles=roles,
+                                 tenant=TENANT) as core:
+        f = core.client.touch(folder_uid, f"drop-{uuid.uuid4().hex[:8]}.bin")
+        f = getattr(f, "uid", f)
+        core.client.put(f, b"payload")
+    return str(f)
+
+
 def _mint(cfg, conn, *, created_by: str, recipients=("a@example.com",),
           depth=3, path="/projects/deep/file.txt", kind_override=0,
           resource_uid=None, **kw):
@@ -422,3 +434,119 @@ def test_a_dead_link_lands_in_needs_attention_with_a_reason(client, plain,
     assert row is not None, "a link to a non-existent resource must be flagged"
     assert row["status"] == "not_working"
     assert row["not_working_message"]
+
+
+# --- drop provenance in the file list (durable marker) --------------------
+
+def _record_drop(conn, cfg, *, link, email, result_uid):
+    """A completed drop, as sessions.record_drop leaves it."""
+    from share_service import sessions
+    import datetime as dt
+    red = str(uuid.uuid4())
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO share_redemptions
+                 (redemption_uid, link_uid, expires_at, verified_email, result_uid)
+               VALUES (%s,%s,now() + interval '1 hour',%s,%s)""",
+            (red, link.link_uid, email, result_uid))
+    conn.commit()
+    return red
+
+
+def test_provenance_marks_a_file_that_came_from_outside(client, admin, cfg, conn,
+                                                        real_folder):
+    box = _mint(cfg, conn, created_by=ADMIN, kind_override=1,
+                resource_uid=real_folder)
+    dropped = _real_file(cfg, real_folder)
+    _record_drop(conn, cfg, link=box, email="bob@contractor.example",
+                 result_uid=dropped)
+
+    r = client.post("/share/v1/files/provenance",
+                    json={"file_uids": [dropped]}, headers=admin)
+    assert r.status_code == 200, r.text
+    got = r.json()["provenance"]
+    assert got[dropped]["email"] == "bob@contractor.example"
+    assert got[dropped]["shared_by"] == ADMIN
+
+
+def test_an_ordinary_file_has_no_provenance(client, admin, cfg, real_folder):
+    """Absence is the common case and must be cheap and silent."""
+    plain_file = _real_file(cfg, real_folder)
+    r = client.post("/share/v1/files/provenance",
+                    json={"file_uids": [plain_file]}, headers=admin)
+    assert r.json()["provenance"] == {}
+
+
+def test_the_marker_is_exactly_as_visible_as_the_file(client, plain, cfg, conn,
+                                                      real_folder):
+    """The filter tracks the FILE's visibility, and that is the whole rule.
+
+    Worth stating plainly, because it is weaker than it first looks: the core is
+    read-by-default (`default_read_ = true`), so an unrelated signed-in user can
+    reach most files and therefore sees the marker too. That is the intended
+    posture rather than a hole — if you may read the file, knowing it arrived
+    from outside is not an escalation, and it is precisely the fact a colleague
+    browsing the folder most needs.
+
+    What the filter does stop is the endpoint answering for uids the caller
+    cannot reach at all — see the deleted-resource test below, which is the case
+    that actually bites.
+    """
+    box = _mint(cfg, conn, created_by=ADMIN, kind_override=1,
+                resource_uid=real_folder)
+    dropped = _real_file(cfg, real_folder)
+    _record_drop(conn, cfg, link=box, email="bob@contractor.example",
+                 result_uid=dropped)
+    r = client.post("/share/v1/files/provenance",
+                    json={"file_uids": [dropped]}, headers=plain)
+    assert r.status_code == 200
+    # Readable by this caller => marked for this caller.
+    assert r.json()["provenance"][dropped]["email"] == "bob@contractor.example"
+
+
+def test_a_uid_that_does_not_exist_yields_nothing(client, admin, cfg, conn,
+                                                  real_folder):
+    """can_reach, not check_permission: read-by-default means a MISSING uid
+    passes a bare permission check, so a stale row would be served."""
+    box = _mint(cfg, conn, created_by=ADMIN, kind_override=1,
+                resource_uid=real_folder)
+    ghost = str(uuid.uuid4())
+    _record_drop(conn, cfg, link=box, email="bob@contractor.example",
+                 result_uid=ghost)
+    r = client.post("/share/v1/files/provenance",
+                    json={"file_uids": [ghost]}, headers=admin)
+    assert r.json()["provenance"] == {}
+
+
+def test_provenance_survives_a_move(client, admin, cfg, conn, real_folder):
+    """The marker is keyed on the file uid, so relocating the file keeps it —
+    a path-keyed marker would lose exactly the file someone tidied away."""
+    from share_service import core_client, ldap_roles
+    box = _mint(cfg, conn, created_by=ADMIN, kind_override=1,
+                resource_uid=real_folder)
+    dropped = _real_file(cfg, real_folder)
+    _record_drop(conn, cfg, link=box, email="bob@contractor.example",
+                 result_uid=dropped)
+
+    roles = ldap_roles.resolve_share_roles(cfg, ADMIN)
+    with core_client.for_creator(cfg, created_by=ADMIN, roles=roles,
+                                 tenant=TENANT) as core:
+        elsewhere = core.client.mkdir(real_folder, f"moved-{uuid.uuid4().hex[:6]}")
+        elsewhere = getattr(elsewhere, "uid", elsewhere)
+        moved = getattr(core.client, "move", None)
+        if moved is None:
+            pytest.skip("this client build has no move()")
+        moved(dropped, elsewhere)
+
+    r = client.post("/share/v1/files/provenance",
+                    json={"file_uids": [dropped]}, headers=admin)
+    assert r.json()["provenance"].get(dropped, {}).get("email") \
+        == "bob@contractor.example"
+
+
+def test_the_batch_is_capped(client, admin, cfg):
+    """Bounds the ACL work a single request can ask the core to do."""
+    many = [str(uuid.uuid4()) for _ in range(cfg.provenance_batch_max + 50)]
+    r = client.post("/share/v1/files/provenance",
+                    json={"file_uids": many}, headers=admin)
+    assert r.status_code == 200
