@@ -34,7 +34,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from . import core_client, db
+from . import api, core_client, db
 from . import metrics as _fe_metrics
 from .audit import get_emitter
 from .config import Config, get_config
@@ -49,6 +49,10 @@ def create_app(config: Config) -> FastAPI:
                   description="Outside share links — verified-recipient download & drop links",
                   version=__version__)
     app.state.config = config
+    # Owner-side routes only. The unauthenticated public router (M4) mounts
+    # separately, with its own dependencies -- never as exceptions inside this
+    # one (spec §7).
+    app.include_router(api.router)
     return app
 
 
