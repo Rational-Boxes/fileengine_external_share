@@ -292,3 +292,54 @@ def test_another_users_ledger_is_not_readable(cfg, client, auth, root_dir):
              "X-Tenant": TENANT}
     assert client.get(f"/share/v1/links/{link_uid}/redemptions",
                       headers=other).status_code == 404
+
+
+def test_a_file_link_records_the_file_size_at_creation(cfg, client, auth, root_dir):
+    """The recipient's "should I tap Download on this phone?" number.
+
+    It is captured HERE, while a delegated core connection is already open for
+    the kind check and the version pin, rather than stat'd when the link is
+    peeked: /peek takes no credential, so a core call on that route would let
+    anyone holding the URL drive delegated work as the creator.
+    """
+    from share_service import core_client, ldap_roles
+    payload = b"x" * 4096
+    roles = ldap_roles.resolve_share_roles(cfg, USER)
+    with core_client.for_creator(cfg, created_by=USER, roles=roles,
+                                 tenant=TENANT) as core:
+        f = core.client.touch(root_dir, f"size-{uuid.uuid4().hex[:8]}.bin")
+        f = getattr(f, "uid", f)
+        core.client.put(f, payload)
+
+    r = client.post(f"/share/v1/nodes/{f}/links",
+                    json={"kind": 0, "recipients": ["someone@example.com"],
+                          "ttl_days": 1, "max_uses": 3},
+                    headers=auth)
+    assert r.status_code == 201, r.text
+
+    # Surfaced on the unauthenticated peek, straight from the stored row.
+    uid = r.json()["link_uid"]
+    secret = r.json()["url"].rsplit(".", 1)[-1]
+    p = client.get(f"/share/v1/public/{uid}",
+                   headers={"X-Share-Secret": secret, "X-Tenant": TENANT})
+    assert p.status_code == 200, p.text
+    assert p.json()["size_bytes"] == len(payload)
+
+
+def test_create_refuses_a_field_it_cannot_store(cfg, root_dir):
+    """A guard on the guard.
+
+    create() used to filter its kwargs down to the keys it knew, so a caller
+    passing a field the INSERT does not carry got a link built from defaults and
+    no indication anything had been dropped. That is how a budget silently is
+    not enforced, and it cost a debugging session when archive_bytes was added.
+    """
+    from share_service import db, links
+    conn = db.connect_for_tenant(cfg, TENANT, provision=True)
+    try:
+        with pytest.raises(TypeError, match="max_usez"):
+            links.create(conn, kind=2, resource_uid=root_dir, created_by=USER,
+                         expires_at=links.clamp_expiry(cfg, None, 1),
+                         recipients=["someone@example.com"], max_usez=5)
+    finally:
+        conn.close()

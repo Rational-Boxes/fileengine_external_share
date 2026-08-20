@@ -256,7 +256,10 @@ def peek(link_uid: str, request: Request, k: Optional[str] = None,
             payload["bytes_remaining"] = (None if link.max_bytes == 0
                                           else max(0, link.max_bytes - link.bytes_consumed))
         else:
-            payload["size_bytes"] = None
+            # Captured at creation (api.py), not stat'd here: this route is
+            # unauthenticated, and a core call on it would let anyone holding
+            # the URL drive delegated work as the creator.
+            payload["size_bytes"] = link.archive_bytes
         # Deliberately absent: the resource uid, the creator's identity, the
         # recipient list, and how many recipients there are (spec §6.6).
         return _json(payload)
@@ -595,6 +598,7 @@ async def drop_file(link_uid: str, request: Request, k: Optional[str] = None,
 
 @router.get("/{link_uid}/content")
 def content(link_uid: str, request: Request, k: Optional[str] = None,
+            redemption: Optional[str] = None,
             x_share_secret: Optional[str] = Header(default=None),
             x_redemption_uid: Optional[str] = Header(default=None)):
     """Stream the payload. Requires an open session; consumes nothing further.
@@ -607,7 +611,13 @@ def content(link_uid: str, request: Request, k: Optional[str] = None,
     cfg, tenant, conn, link = _resolve(request, link_uid, x_share_secret or k)
     closed = False
     try:
-        session = _require_session(conn, link_uid, x_redemption_uid)
+        # The redemption may arrive as a header (XHR) or a query parameter. The
+        # query form exists because a browser NAVIGATION cannot set headers, and
+        # the payload has to be a plain navigation: pulling gigabytes through
+        # XHR to hand them back as a blob would defeat the streaming the whole
+        # path was built for. It is why nginx strips the query string from this
+        # location's access log (spec §7.2).
+        session = _require_session(conn, link_uid, x_redemption_uid or redemption)
         if link.kind == KIND_UPLOAD:
             raise _deny()
 

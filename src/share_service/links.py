@@ -169,9 +169,16 @@ def create(conn, *, kind: int, resource_uid: str, created_by: str,
         "max_uses": 0, "max_uses_per_recipient": 0, "max_bytes": 0,
         "max_file_bytes": 0, "max_files": 0, "pinned_version": None,
         "follow_folder": False, "include_subdirs": True, "landing_prefix": None,
-        "ext_allowlist": None, "note": None,
+        "ext_allowlist": None, "note": None, "archive_bytes": None,
     }
-    fields.update({k: v for k, v in budgets.items() if k in fields})
+    # Reject rather than ignore. Filtering silently to the known keys turns a
+    # typo — or a newly added budget the INSERT does not carry yet — into a
+    # link created with a default nobody asked for, which surfaces later as a
+    # limit that mysteriously is not enforced.
+    unknown = set(budgets) - set(fields)
+    if unknown:
+        raise TypeError(f"create() got unexpected link fields: {sorted(unknown)}")
+    fields.update(budgets)
 
     with conn.cursor() as cur:
         cur.execute(
@@ -179,13 +186,14 @@ def create(conn, *, kind: int, resource_uid: str, created_by: str,
                  (link_uid, kind, resource_uid, secret_hash, created_by, expires_at,
                   max_uses, max_uses_per_recipient, max_bytes, max_file_bytes,
                   max_files, pinned_version, follow_folder, include_subdirs,
-                  landing_prefix, ext_allowlist, note)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                  landing_prefix, ext_allowlist, note, archive_bytes)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (link_uid, kind, resource_uid, hash_secret(secret), created_by, expires_at,
              fields["max_uses"], fields["max_uses_per_recipient"], fields["max_bytes"],
              fields["max_file_bytes"], fields["max_files"], fields["pinned_version"],
              fields["follow_folder"], fields["include_subdirs"],
-             fields["landing_prefix"], fields["ext_allowlist"], fields["note"]))
+             fields["landing_prefix"], fields["ext_allowlist"], fields["note"],
+             fields["archive_bytes"]))
 
         for email in recipients:
             cur.execute(

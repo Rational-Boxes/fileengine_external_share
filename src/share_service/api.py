@@ -199,6 +199,7 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
     # Both need a delegated client, so they share one.
     snap = None
     pinned_version = None
+    file_bytes = None
     try:
         with core_client.for_creator(cfg, created_by=caller.user, roles=result.roles or [],
                                      tenant=caller.tenant,
@@ -212,13 +213,22 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
             # it keeps serving what it was minted for. Unpinned is the explicit
             # opt-in: without this a document shared for review in March
             # silently exposes whatever it becomes in September (spec §6.2).
-            if body.kind == KIND_FILE_DOWNLOAD and not body.follow_latest:
-                pinned_version = core.current_version(resource_uid)
-                if not pinned_version:
-                    raise HTTPException(
-                        status.HTTP_400_BAD_REQUEST,
-                        "this file has no saved version yet, so there is "
-                        "nothing to share")
+            if body.kind == KIND_FILE_DOWNLOAD:
+                # Recorded now, into the same column a folder link uses for its
+                # archive total, so /peek stays a pure DB read: that route is
+                # unauthenticated, and it must not turn an anonymous visitor
+                # into a delegated core call.
+                try:
+                    file_bytes = int(core.stat(resource_uid).size)
+                except Exception:  # noqa: BLE001
+                    file_bytes = None
+                if not body.follow_latest:
+                    pinned_version = core.current_version(resource_uid)
+                    if not pinned_version:
+                        raise HTTPException(
+                            status.HTTP_400_BAD_REQUEST,
+                            "this file has no saved version yet, so there is "
+                            "nothing to share")
             # A folder-download link captures its members now (spec §6.5).
             # `follow_folder` opts into live semantics and takes no snapshot.
             if body.kind == KIND_FOLDER_DOWNLOAD and not body.follow_folder:
@@ -249,7 +259,7 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
             pinned_version=pinned_version,
             follow_folder=body.follow_folder, include_subdirs=body.include_subdirs,
             landing_prefix=body.landing_prefix, ext_allowlist=body.ext_allowlist,
-            note=body.note)
+            archive_bytes=file_bytes, note=body.note)
 
         if snap is not None:
             snapshot_mod.store(conn, link.link_uid, snap)

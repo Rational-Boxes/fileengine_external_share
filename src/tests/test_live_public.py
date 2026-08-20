@@ -676,3 +676,30 @@ def test_folder_members_stream_into_the_archive(client, cfg, roles, tree, verifi
     zf = zipfile.ZipFile(io.BytesIO(r.content))
     assert zf.testzip() is None
     assert len(zf.read("doc.txt")) == 9 * 1024 * 1024
+
+
+def test_content_accepts_the_redemption_as_a_query_parameter(client, cfg, roles,
+                                                             tree, verified):
+    """A browser navigation cannot set headers, and the payload must be a plain
+    navigation so the download streams rather than passing through XHR."""
+    root, _ = tree
+    link, secret = _mint(cfg, roles, root)
+    r = client.post(f"/share/v1/public/{link.link_uid}/session",
+                    headers=_h(secret, **{"X-Recipient-Token": verified}),
+                    json={"email": RECIPIENT})
+    redemption = r.json()["redemption_uid"]
+
+    # Header form and query form must be equivalent.
+    by_header = client.get(f"/share/v1/public/{link.link_uid}/content",
+                           headers=_h(secret, **{"X-Redemption-Uid": redemption}))
+    by_query = client.get(
+        f"/share/v1/public/{link.link_uid}/content?k={secret}&redemption={redemption}",
+        headers={"X-Tenant": TENANT})
+    assert by_header.status_code == by_query.status_code == 200
+    assert by_header.content == by_query.content
+
+    # A bogus redemption in the query is still the uniform 404.
+    bad = client.get(
+        f"/share/v1/public/{link.link_uid}/content?k={secret}&redemption={uuid.uuid4()}",
+        headers={"X-Tenant": TENANT})
+    assert bad.status_code == 404
