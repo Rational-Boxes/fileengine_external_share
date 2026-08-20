@@ -1,0 +1,38 @@
+[project]
+name = "share-service"
+version = "0.1.0"
+description = "FileEngine outside share links: verified-recipient download and drop links, with no change to the core"
+license = {text = "AGPL-3.0-or-later"}
+authors = [{name = "James Hickman", email = "james@rationalboxes.com"}]
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.30",
+    "ldap3>=2.9",              # creator role resolution over the service bind
+    "grpcio>=1.50",
+    "protobuf>=4.21",
+    "psycopg[binary]>=3.1",
+    "redis>=5.0",             # audit stream (via audit_service.publisher)
+    "pydantic>=2.0",
+    "PyJWT>=2.8",             # bearer verification against the shared HS256 secret
+]
+# The FileEngine Python client (`fileengine`, from ../python_interface) is reused at
+# runtime for delegated gRPC core access; install it (`pip install ../python_interface`).
+# The audit publisher comes from ../audit_service (imported with a sibling-checkout
+# fallback, see audit.py).
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "httpx>=0.27"]
+
+[project.scripts]
+share-service = "share_service.app:main"                 # API (:8101)
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+markers = ["live: integration test that needs LDAP + the gRPC core + Postgres + Redis reachable"]
