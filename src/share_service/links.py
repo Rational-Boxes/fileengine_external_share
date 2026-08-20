@@ -296,6 +296,38 @@ def remove_recipient(conn, link_uid: str, email: str, removed_by: str) -> bool:
     return changed
 
 
+def redemptions(conn, link_uid: str, limit: int = 200) -> List[dict]:
+    """The usage ledger for one link — who, when, from where, how much.
+
+    This is what answers "did they actually get it?" for a hand-off with no
+    account on the far side, and for a drop box it is "what did they send us":
+    ``result_uid`` links to the file each drop created, so that is one click
+    rather than a hunt through the folder.
+
+    Newest first. `verified_email` is PII and belongs to the creator's own
+    link — the route above it is what enforces that.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT redemption_uid, opened_at, completed_at, verified_email,
+                      source_addr, user_agent, bytes_moved, files_moved,
+                      result_uid, archive_bytes,
+                      coalesce(array_length(frozen_members, 1), 0)
+                 FROM share_redemptions
+                WHERE link_uid = %s
+                ORDER BY opened_at DESC
+                LIMIT %s""",
+            (link_uid, limit))
+        rows = cur.fetchall()
+    return [{
+        "redemption_uid": str(r[0]), "opened_at": r[1], "completed_at": r[2],
+        "verified_email": r[3], "source_addr": r[4], "user_agent": r[5],
+        "bytes_moved": r[6], "files_moved": r[7],
+        "result_uid": str(r[8]) if r[8] else None,
+        "archive_bytes": r[9], "members_served": r[10],
+    } for r in rows]
+
+
 def count_recipients(conn, link_uid: str) -> int:
     with conn.cursor() as cur:
         cur.execute("""SELECT count(*) FROM share_link_recipients

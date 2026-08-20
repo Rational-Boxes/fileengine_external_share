@@ -40,6 +40,7 @@ pytestmark = pytest.mark.live
 
 USER = "testuser@rationalboxes.com"
 TENANT = "default"
+RECIPIENT_A = "ledger-recipient@example.com"
 
 
 def _b64(raw: bytes) -> str:
@@ -248,3 +249,46 @@ def test_recipient_add_and_partial_revoke(cfg, client, auth, root_dir):
                    headers=auth)
     removed = [x for x in r.json()["recipients"] if x["email"] == "first@example.com"]
     assert removed and removed[0]["status"] == "removed"
+
+
+def test_redemption_ledger_is_readable_by_the_creator(cfg, client, auth, root_dir):
+    """"Did they actually get it?" has no other answer when there is no account
+    on the far side. Read from this service's own rows, so an ordinary creator
+    needs no AUDIT_READ scope (spec §10.2)."""
+    r = client.post(f"/share/v1/nodes/{root_dir}/links",
+                    json={"kind": 2, "recipients": [RECIPIENT_A], "max_uses": 3},
+                    headers=auth)
+    link_uid = r.json()["link_uid"]
+
+    r = client.get(f"/share/v1/links/{link_uid}/redemptions", headers=auth)
+    assert r.status_code == 200
+    assert r.json()["redemptions"] == []      # nobody has used it yet
+
+    # A session is what a redemption IS, so open one directly.
+    from share_service import sessions, ldap_roles
+    conn = db.connect_for_tenant(cfg, TENANT, provision=True)
+    try:
+        roles = ldap_roles.resolve_share_roles(cfg, USER)
+        s = sessions.open_session(conn, cfg, link_uid=link_uid,
+                                  verified_email=RECIPIENT_A, tenant=TENANT,
+                                  roles=roles, source_addr="203.0.113.9")
+    finally:
+        conn.close()
+
+    r = client.get(f"/share/v1/links/{link_uid}/redemptions", headers=auth)
+    led = r.json()["redemptions"]
+    assert len(led) == 1
+    assert led[0]["verified_email"] == RECIPIENT_A
+    assert led[0]["source_addr"] == "203.0.113.9"
+    assert led[0]["redemption_uid"] == s.redemption_uid
+
+
+def test_another_users_ledger_is_not_readable(cfg, client, auth, root_dir):
+    r = client.post(f"/share/v1/nodes/{root_dir}/links",
+                    json={"kind": 2, "recipients": [RECIPIENT_A], "max_uses": 1},
+                    headers=auth)
+    link_uid = r.json()["link_uid"]
+    other = {"Authorization": f"Bearer {_token(cfg, user='someone-else@example.com')}",
+             "X-Tenant": TENANT}
+    assert client.get(f"/share/v1/links/{link_uid}/redemptions",
+                      headers=other).status_code == 404

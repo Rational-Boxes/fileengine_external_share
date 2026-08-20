@@ -386,6 +386,24 @@ def list_recipients(link_uid: str, request: Request, include_removed: bool = Fal
     return {"recipients": roster}
 
 
+@router.get("/links/{link_uid}/redemptions")
+def list_redemptions(link_uid: str, request: Request, limit: int = 200,
+                     caller: Caller = Depends(get_caller)) -> dict:
+    """The link's usage ledger (spec §7.1).
+
+    Read from this service's own rows rather than from the audit log, so an
+    ordinary creator can see who used their link without holding an AUDIT_READ
+    scope. The full forensic trail stays in `audit_service` for anyone who does.
+    """
+    cfg = _config(request)
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        _owned_link(conn, link_uid, caller)
+        return {"redemptions": links.redemptions(conn, link_uid, limit=min(limit, 500))}
+    finally:
+        conn.close()
+
+
 @router.post("/links/{link_uid}/recipients", status_code=status.HTTP_201_CREATED)
 def add_recipient(link_uid: str, body: AddRecipientRequest, request: Request,
                   caller: Caller = Depends(get_caller)) -> dict:
