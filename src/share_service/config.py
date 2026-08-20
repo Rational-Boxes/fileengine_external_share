@@ -61,6 +61,15 @@ def _env(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
+def _first(*keys_and_default: str) -> str:
+    *keys, default = keys_and_default
+    for k in keys:
+        v = os.environ.get(k)
+        if v:
+            return v
+    return default
+
+
 def _bool(key: str, default: bool = False) -> bool:
     v = os.environ.get(key)
     return default if v is None else v.strip().lower() in ("1", "true", "yes", "on")
@@ -99,6 +108,19 @@ class Config:
         # The same HS256 secret http_bridge signs its session tokens with.
         self.jwt_secret = _env("FILEENGINE_JWT_SECRET", "")
         self.jwt_issuer = _env("FILEENGINE_JWT_ISSUER", "fileengine-bridge")
+
+        # --- Recipient OTP, via ldap_manager (SHARED seam) -----------------
+        # That service owns the code and the recipient token; this one owns the
+        # allowlist. Every call fails closed (spec §6.9).
+        self.ldap_manager_url = _env("FILEENGINE_LDAP_MANAGER_URL",
+                                     "http://localhost:8093")
+        self.share_internal_secret = _first("SHARE_INTERNAL_SECRET",
+                                            "MFA_INTERNAL_SECRET", "")
+        self.otp_timeout_s = _int("SHARE_OTP_TIMEOUT_S", 5)
+        # Tenant for a public request that carries no X-Tenant. In the stack
+        # nginx sets it from the subdomain; this is the dev fallback.
+        self.default_tenant = _env("SHARE_DEFAULT_TENANT", "default")
+        self.otp_ttl_seconds = _int("SHARE_OTP_TTL_SECONDS", 600)
 
         # --- Audit (SHARED) -----------------------------------------------
         # NOT optional here: the audit chain is the only record that an access
