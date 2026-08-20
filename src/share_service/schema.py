@@ -91,6 +91,22 @@ def _ddl(schema: str) -> list[str]:
             note            TEXT
         );
         """,
+        # --- oversight columns (spec §10.3) ---------------------------------
+        # Both are recorded at CREATION, from the delegated core connection that
+        # is already open, and both are deliberately a snapshot rather than a
+        # live lookup:
+        #
+        #   * the admin console lists a whole tenant, and resolving a path per
+        #     row would be one core round-trip per link on every page load;
+        #   * /peek is unauthenticated and must never drive core work at all.
+        #
+        # The cost is that a later move or rename makes them stale, so the
+        # console labels the column "at share time" rather than implying it is
+        # current. Depth exists to answer the question the console is FOR — a
+        # link on a project root is the finding, a link on one leaf file is
+        # routine — so it sorts risk without needing the tree at read time.
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS resource_depth INTEGER;",
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS resource_path TEXT;",
         f"CREATE INDEX IF NOT EXISTS share_links_resource ON {s}.share_links (resource_uid);",
         f"CREATE INDEX IF NOT EXISTS share_links_creator  ON {s}.share_links (created_by);",
         f"CREATE INDEX IF NOT EXISTS share_links_live     ON {s}.share_links (expires_at) "

@@ -32,7 +32,7 @@ import logging
 from datetime import datetime
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 from . import core_client, db, links, preflight, snapshot as snapshot_mod
@@ -118,19 +118,55 @@ def _require_enabled(cfg: Config) -> None:
                             "audit unavailable; share links refuse to operate")
 
 
-def _owned_link(conn, link_uid: str, caller: Caller) -> links.Link:
+def is_tenant_admin(cfg: Config, caller: Caller) -> bool:
+    """Whether this caller may use the oversight console (spec §10.3).
+
+    Read from the roles the bridge put in the signed token, scoped to the ACTIVE
+    tenant by `identity_from_claims` — so an administrator of tenant A is an
+    ordinary user in tenant B, and switching tenants cannot carry the power
+    across.
+
+    NB this deliberately does NOT go through `ldap_roles.resolve_share_roles`,
+    which strips exactly these roles. That stripping governs what this service
+    hands the CORE on a delegated call, where an admin role would become an ACL
+    bypass on behalf of an absent creator. Asking "may this human open the
+    console?" is the opposite question, and answering it from the stripped list
+    would make the console permanently empty for everyone.
+    """
+    return any(caller.has_role(r) for r in cfg.admin_roles)
+
+
+def _require_admin(cfg: Config, caller: Caller) -> None:
+    if not is_tenant_admin(cfg, caller):
+        # 403, not 404: unlike a link uid, the existence of the console is not
+        # a secret, and a silent empty list would read as "nothing is shared".
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "tenant administrator role required")
+
+
+def _owned_link(conn, link_uid: str, caller: Caller,
+                cfg: Optional[Config] = None) -> links.Link:
     """Fetch a link the caller may act on, or 404.
 
     404 rather than 403 for someone else's link: whether a link exists is not
     something an unrelated user should be able to probe.
+
+    A tenant admin may act on any link in their tenant — but only when `cfg` is
+    passed, so admin reach is something a route opts INTO rather than something
+    every existing caller of this helper silently inherits.
     """
     try:
         link = links.get(conn, link_uid)
     except links.LinkNotFound:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "not_found")
     if link.created_by != caller.user:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "not_found")
+        if cfg is None or not is_tenant_admin(cfg, caller):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "not_found")
     return link
+
+
+class RevokeAllRequest(BaseModel):
+    creator: str
 
 
 def _public_url(cfg: Config, request: Request, link_uid: str, secret: str) -> str:
@@ -200,11 +236,17 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
     snap = None
     pinned_version = None
     file_bytes = None
+    depth = None
+    path = ""
     try:
         with core_client.for_creator(cfg, created_by=caller.user, roles=result.roles or [],
                                      tenant=caller.tenant,
                                      source_addr=caller.source_addr) as core:
             is_dir = core.is_dir(resource_uid)
+            # Where this sits in the tree, captured once. The admin console
+            # sorts by it (spec §10.3) and cannot afford a core round-trip per
+            # row across a whole tenant.
+            depth, path = core.locate(resource_uid)
             if not links.kind_matches_resource(body.kind, is_dir):
                 raise HTTPException(status.HTTP_400_BAD_REQUEST,
                                     "kind does not match the resource type "
@@ -259,7 +301,8 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
             pinned_version=pinned_version,
             follow_folder=body.follow_folder, include_subdirs=body.include_subdirs,
             landing_prefix=body.landing_prefix, ext_allowlist=body.ext_allowlist,
-            archive_bytes=file_bytes, note=body.note)
+            archive_bytes=file_bytes, resource_depth=depth, resource_path=path,
+            note=body.note)
 
         if snap is not None:
             snapshot_mod.store(conn, link.link_uid, snap)
@@ -312,15 +355,93 @@ def list_node_links(resource_uid: str, request: Request,
 
 
 @router.get("/links")
-def list_my_links(request: Request, live: bool = True,
+def list_my_links(request: Request, live: bool = True, all: bool = False,
+                  creator: str = "", recipient: str = "", subtree: str = "",
+                  status_filter: str = Query("", alias="status"),
                   caller: Caller = Depends(get_caller)) -> dict:
+    """The caller's own links, or — with `all=true` and the admin role — the
+    tenant-wide oversight view (spec §10.3).
+
+    One route rather than two because the shape is identical and the ONLY
+    difference is scope; a separate /admin/links would invite the two to drift
+    into disagreeing about what "expired" means.
+    """
     cfg = _config(request)
     conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
     try:
-        found = links.list_for_creator(conn, caller.user, live_only=live)
+        if not all:
+            found = links.list_for_creator(conn, caller.user, live_only=live)
+            return {"links": [_link_json(l) for l in found]}
+
+        _require_admin(cfg, caller)
+        rows = links.list_for_tenant(
+            conn, live_only=live, creator=creator, recipient=recipient,
+            subtree=subtree, status=status_filter)
     finally:
         conn.close()
-    return {"links": [_link_json(l) for l in found]}
+
+    return {"links": [
+        # The extra columns exist only on this view. `creator` is the
+        # departed-employee query's pivot, so it is first-class here while the
+        # owner-side view has no use for it.
+        {**_link_json(r["link"]),
+         "creator": r["link"].created_by,
+         "recipient_count": r["recipient_count"],
+         "last_activity": r["last_activity"],
+         "resource_path": r["link"].resource_path,
+         "resource_depth": r["link"].resource_depth}
+        for r in rows], "scope": "tenant"}
+
+
+@router.post("/admin/revoke-all")
+def admin_revoke_all(body: RevokeAllRequest, request: Request,
+                     caller: Caller = Depends(get_caller)) -> dict:
+    """End every live link one creator left open — the departed-employee action.
+
+    Audited one event per link, with the acting ADMIN as actor and the creator
+    recorded in the detail. A single "revoked 14 links" event is not a record
+    anyone can later answer questions from, and the person who pushed the button
+    is the fact an oversight trail most needs.
+    """
+    cfg = _config(request)
+    _require_admin(cfg, caller)
+    target = (body.creator or "").strip()
+    if not target:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "creator is required")
+
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        # Read the rows BEFORE revoking: the audit event wants each link's
+        # resource_uid, and after the update they no longer match "live".
+        doomed = {r["link"].link_uid: r["link"]
+                  for r in links.list_for_tenant(conn, live_only=True,
+                                                 creator=target, limit=10000)}
+        revoked = links.revoke_all_for_creator(conn, target, caller.user)
+    finally:
+        conn.close()
+
+    unaudited = []
+    for uid in revoked:
+        link = doomed.get(uid)
+        try:
+            get_emitter(cfg).emit_or_raise(
+                action="share_link_revoke", outcome="ok", category="permission",
+                actor=caller.user, tenant=caller.tenant,
+                target_uid=link.resource_uid if link else "",
+                source_addr=caller.source_addr, request_id=uid,
+                detail={"link_uid": uid, "creator": target,
+                        "by": "admin_revoke_all"})
+        except AuditUnavailable:
+            unaudited.append(uid)
+
+    if unaudited:
+        # Same rule as the single revoke: the safe direction already happened,
+        # so report the gap loudly rather than rolling access back open.
+        log.error("admin_revoke_all NOT audited for %s", unaudited)
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            f"{len(revoked)} links revoked, but {len(unaudited)} "
+                            "audit records could not be written — report this")
+    return {"creator": target, "revoked": len(revoked), "link_uids": revoked}
 
 
 @router.get("/links/{link_uid}")
@@ -336,7 +457,7 @@ def get_link(link_uid: str, request: Request,
     cfg = _config(request)
     conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
     try:
-        link = _owned_link(conn, link_uid, caller)
+        link = _owned_link(conn, link_uid, caller, cfg)
     finally:
         conn.close()
 
@@ -361,10 +482,14 @@ def revoke_link(link_uid: str, request: Request,
     cfg = _config(request)
     conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
     try:
-        link = _owned_link(conn, link_uid, caller)
+        # cfg passed => a tenant admin may revoke someone else's link. This is
+        # the ONE power the console adds; it cannot mint, cannot re-send (the
+        # plaintext secret does not exist server-side), and cannot read content.
+        link = _owned_link(conn, link_uid, caller, cfg)
         changed = links.revoke(conn, link_uid, caller.user)
     finally:
         conn.close()
+    on_behalf = link.created_by != caller.user
 
     if changed:
         try:
@@ -372,7 +497,9 @@ def revoke_link(link_uid: str, request: Request,
                 action="share_link_revoke", outcome="ok", category="permission",
                 actor=caller.user, tenant=caller.tenant, target_uid=link.resource_uid,
                 source_addr=caller.source_addr, request_id=link_uid,
-                detail={"link_uid": link_uid})
+                detail={"link_uid": link_uid,
+                        **({"creator": link.created_by, "by": "admin"}
+                           if on_behalf else {})})
         except AuditUnavailable:
             # The revocation already happened and is the safe direction; do not
             # roll it back over an audit failure. Report the gap loudly instead.
@@ -389,7 +516,7 @@ def list_recipients(link_uid: str, request: Request, include_removed: bool = Fal
     cfg = _config(request)
     conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
     try:
-        _owned_link(conn, link_uid, caller)
+        _owned_link(conn, link_uid, caller, cfg)
         roster = links.recipients(conn, link_uid, include_removed=include_removed)
     finally:
         conn.close()
@@ -408,7 +535,7 @@ def list_redemptions(link_uid: str, request: Request, limit: int = 200,
     cfg = _config(request)
     conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
     try:
-        _owned_link(conn, link_uid, caller)
+        _owned_link(conn, link_uid, caller, cfg)
         return {"redemptions": links.redemptions(conn, link_uid, limit=min(limit, 500))}
     finally:
         conn.close()
@@ -428,6 +555,10 @@ def add_recipient(link_uid: str, body: AddRecipientRequest, request: Request,
 
     conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
     try:
+        # No `cfg` here, deliberately: an admin must not widen someone else's
+        # link. Console powers stop at revocation (spec §10.3) - adding an
+        # address is a grant of access, the direction oversight is meant to
+        # close, not open.
         _owned_link(conn, link_uid, caller)
         if links.count_recipients(conn, link_uid) >= cfg.max_recipients:
             raise HTTPException(status.HTTP_400_BAD_REQUEST,
@@ -459,7 +590,7 @@ def remove_recipient(link_uid: str, email: str, request: Request,
     normalized = links.normalize_email(email)
     conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
     try:
-        _owned_link(conn, link_uid, caller)
+        _owned_link(conn, link_uid, caller, cfg)
         changed = links.remove_recipient(conn, link_uid, normalized, caller.user)
     finally:
         conn.close()

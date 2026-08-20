@@ -29,6 +29,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import re
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -48,6 +49,11 @@ class LinkNotFound(LookupError):
 
 
 # --- token ---------------------------------------------------------------
+
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
 
 def mint_secret() -> str:
     """A 256-bit base64url secret (43 chars, no padding)."""
@@ -99,6 +105,10 @@ class Link:
     ext_allowlist: Optional[List[str]] = None
     locked_until: Optional[datetime] = None
     note: Optional[str] = None
+    # Snapshots taken at creation, for the admin console's risk ordering.
+    # Stale after a move or rename by design (see schema.py).
+    resource_depth: Optional[int] = None
+    resource_path: Optional[str] = None
 
     @property
     def is_revoked(self) -> bool:
@@ -136,7 +146,7 @@ _COLUMNS = """link_uid, kind, resource_uid, created_by, created_at, expires_at,
               max_uses_per_recipient, max_bytes, bytes_consumed, max_file_bytes,
               max_files, files_consumed, pinned_version, follow_folder,
               include_subdirs, archive_bytes, landing_prefix, ext_allowlist,
-              locked_until, note"""
+              locked_until, note, resource_depth, resource_path"""
 
 
 def _row_to_link(row: tuple) -> Link:
@@ -149,7 +159,8 @@ def _row_to_link(row: tuple) -> Link:
         files_consumed=row[15], pinned_version=row[16], follow_folder=row[17],
         include_subdirs=row[18], archive_bytes=row[19], landing_prefix=row[20],
         ext_allowlist=list(row[21]) if row[21] else None,
-        locked_until=row[22], note=row[23])
+        locked_until=row[22], note=row[23], resource_depth=row[24],
+        resource_path=row[25])
 
 
 # --- writes --------------------------------------------------------------
@@ -170,6 +181,7 @@ def create(conn, *, kind: int, resource_uid: str, created_by: str,
         "max_file_bytes": 0, "max_files": 0, "pinned_version": None,
         "follow_folder": False, "include_subdirs": True, "landing_prefix": None,
         "ext_allowlist": None, "note": None, "archive_bytes": None,
+        "resource_depth": None, "resource_path": None,
     }
     # Reject rather than ignore. Filtering silently to the known keys turns a
     # typo — or a newly added budget the INSERT does not carry yet — into a
@@ -186,14 +198,17 @@ def create(conn, *, kind: int, resource_uid: str, created_by: str,
                  (link_uid, kind, resource_uid, secret_hash, created_by, expires_at,
                   max_uses, max_uses_per_recipient, max_bytes, max_file_bytes,
                   max_files, pinned_version, follow_folder, include_subdirs,
-                  landing_prefix, ext_allowlist, note, archive_bytes)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                  landing_prefix, ext_allowlist, note, archive_bytes,
+                  resource_depth, resource_path)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                       %s,%s)""",
             (link_uid, kind, resource_uid, hash_secret(secret), created_by, expires_at,
              fields["max_uses"], fields["max_uses_per_recipient"], fields["max_bytes"],
              fields["max_file_bytes"], fields["max_files"], fields["pinned_version"],
              fields["follow_folder"], fields["include_subdirs"],
              fields["landing_prefix"], fields["ext_allowlist"], fields["note"],
-             fields["archive_bytes"]))
+             fields["archive_bytes"], fields["resource_depth"],
+             fields["resource_path"]))
 
         for email in recipients:
             cur.execute(
@@ -242,6 +257,106 @@ def list_for_creator(conn, created_by: str, live_only: bool = True) -> List[Link
     with conn.cursor() as cur:
         cur.execute(sql, (created_by,))
         return [_row_to_link(r) for r in cur.fetchall()]
+
+
+def list_for_tenant(conn, *, live_only: bool = True, creator: str = "",
+                    recipient: str = "", subtree: str = "", status: str = "",
+                    limit: int = 500) -> List[dict]:
+    """The tenant-wide oversight query behind ``/links?all=true`` (spec §10.3).
+
+    Returns dicts, not ``Link`` objects, because the console needs two
+    aggregates per row — recipient count and last activity — and fetching them
+    per link would be an N+1 across a whole tenant.
+
+    Ordered by RISK, not by date: shallowest resource first (a link on a project
+    root is the finding; a link on one leaf file is routine), then by how many
+    outside addresses can use it, then by how much budget is left. A hundred
+    expired links are noise.
+    """
+    where = ["1=1"]
+    params: List[Any] = []
+    if live_only:
+        where.append("l.revoked_at IS NULL AND l.expires_at > now()")
+    if creator:
+        where.append("lower(l.created_by) = lower(%s)")
+        params.append(creator)
+    if subtree:
+        # Either a uid (the folder itself) or a path prefix. The uid branch is
+        # guarded because resource_uid is a UUID column: handing it a path
+        # string is a cast error, not an empty result.
+        #
+        # Prefix, anchored, and never a bare substring — "/projects/x" must not
+        # match "/archive/projects/x-old". Matching the path captured at
+        # creation rather than walking the live tree keeps this one query, at
+        # the cost of missing resources MOVED into the subtree after being
+        # shared; the UI labels the column "at share time" for that reason.
+        if _UUID_RE.match(subtree):
+            where.append("l.resource_uid = %s")
+            params.append(subtree)
+        else:
+            base = subtree.rstrip("/")
+            where.append("(l.resource_path = %s OR l.resource_path LIKE %s)")
+            params.extend([base, base + "/%"])
+    if recipient:
+        # Substring, so "@contractor.example" answers the whole-domain question
+        # ("what did we ever send there") and not just one address.
+        where.append("""EXISTS (SELECT 1 FROM share_link_recipients r
+                                WHERE r.link_uid = l.link_uid
+                                  AND r.removed_at IS NULL
+                                  AND r.email LIKE %s)""")
+        params.append(f"%{recipient.lower()}%")
+
+    sql = f"""
+        SELECT {", ".join("l." + c.strip() for c in _COLUMNS.replace(chr(10), " ").split(","))},
+               (SELECT count(*) FROM share_link_recipients r
+                 WHERE r.link_uid = l.link_uid AND r.removed_at IS NULL),
+               (SELECT max(opened_at) FROM share_redemptions d
+                 WHERE d.link_uid = l.link_uid)
+          FROM share_links l
+         WHERE {" AND ".join(where)}
+         ORDER BY COALESCE(l.resource_depth, 9999) ASC,
+                  (SELECT count(*) FROM share_link_recipients r2
+                    WHERE r2.link_uid = l.link_uid AND r2.removed_at IS NULL) DESC,
+                  (CASE WHEN l.max_uses = 0 THEN 2147483647
+                        ELSE l.max_uses - l.uses_consumed END) DESC,
+                  l.created_at DESC
+         LIMIT %s
+    """
+    params.append(limit)
+    with conn.cursor() as cur:
+        cur.execute(sql, tuple(params))
+        rows = cur.fetchall()
+
+    out: List[dict] = []
+    n = len(_COLUMNS.split(","))
+    for r in rows:
+        link = _row_to_link(r[:n])
+        # `status` is computed in Python, not SQL, so the console and the
+        # owner-side Share tab cannot drift apart on what "expired" means.
+        if status and link.status() != status:
+            continue
+        out.append({"link": link, "recipient_count": r[n],
+                    "last_activity": r[n + 1]})
+    return out
+
+
+def revoke_all_for_creator(conn, created_by: str, revoked_by: str) -> List[str]:
+    """The departed-employee action: end every live link one person left open.
+
+    Returns the uids actually revoked, so the caller can audit each one
+    individually — a single "revoked 14 links" event is not a record anyone can
+    later answer questions from.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE share_links SET revoked_at = now(), revoked_by = %s
+                WHERE lower(created_by) = lower(%s)
+                  AND revoked_at IS NULL AND expires_at > now()
+             RETURNING link_uid""",
+            (revoked_by, created_by))
+        uids = [str(r[0]) for r in cur.fetchall()]
+    conn.commit()
+    return uids
 
 
 def recipients(conn, link_uid: str, include_removed: bool = False) -> List[dict]:

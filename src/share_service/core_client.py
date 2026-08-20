@@ -208,6 +208,37 @@ class DelegatedCore:
     def is_dir(self, resource_uid: str) -> bool:
         return bool(self.client.is_dir(resource_uid))
 
+    def locate(self, resource_uid: str, max_depth: int = 64) -> tuple:
+        """``(depth, path)`` for the admin console's risk ordering (spec §10.3).
+
+        Walks parents as the creator, so it sees exactly the tree the creator
+        could see — a parent they cannot read simply ends the walk, and the
+        path is reported from there down rather than guessed at.
+
+        Bounded and cycle-guarded: a corrupt ``parent_uid`` must terminate. It
+        is called once, at creation, and never on a redemption path.
+        """
+        names: List[str] = []
+        seen = set()
+        uid = resource_uid
+        depth = 0
+        while uid and uid not in seen and depth < max_depth:
+            seen.add(uid)
+            try:
+                info = self.client.stat(uid)
+            except Exception:  # noqa: BLE001 - an unreadable parent ends the walk
+                break
+            if not info or not getattr(info, "name", ""):
+                break
+            names.append(info.name)
+            uid = getattr(info, "parent_uid", "") or ""
+            depth += 1
+        if not names:
+            return 0, ""
+        # depth 1 == a child of the root. Reported as the number of ancestors,
+        # so "shared the project root" sorts above "shared one leaf file".
+        return len(names), "/" + "/".join(reversed(names))
+
 
 def for_creator(config: Config, *, created_by: str, roles: List[str], tenant: str,
                 source_addr: str = "", redemption_uid: Optional[str] = None) -> DelegatedCore:

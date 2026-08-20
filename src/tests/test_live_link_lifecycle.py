@@ -47,12 +47,20 @@ def _b64(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
-def _token(cfg: Config, user: str = USER, tenant: str = TENANT) -> str:
-    """A bearer token shaped exactly like the ones http_bridge mints."""
+def _token(cfg: Config, user: str = USER, tenant: str = TENANT,
+           roles=None) -> str:
+    """A bearer token shaped exactly like the ones http_bridge mints.
+
+    `roles` matters since M7: `administrators` is an admin role, and an admin
+    may reach any link in the tenant. A test about what an UNRELATED user can
+    see must therefore pass a role set without it, or it silently tests the
+    admin path instead (spec §10.3).
+    """
     header = _b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
     payload = _b64(json.dumps({
         "sub": user, "tenant": tenant,
-        "roles": {tenant: ["users", "contributors", "administrators"]},
+        "roles": {tenant: list(roles if roles is not None
+                               else ["users", "contributors", "administrators"])},
         "exp": int(time.time()) + 600,
     }).encode())
     sig = hmac.new(cfg.jwt_secret.encode(), f"{header}.{payload}".encode(),
@@ -218,7 +226,8 @@ def test_another_users_link_is_not_found_not_forbidden(cfg, client, auth, root_d
                     headers=auth)
     link_uid = r.json()["link_uid"]
 
-    other = {"Authorization": f"Bearer {_token(cfg, user='someone-else@example.com')}",
+    other = {"Authorization": f"Bearer {_token(cfg, user='someone-else@example.com',
+                                              roles=['users'])}",
              "X-Tenant": TENANT}
     assert client.get(f"/share/v1/links/{link_uid}", headers=other).status_code == 404
     assert client.delete(f"/share/v1/links/{link_uid}", headers=other).status_code == 404
@@ -288,7 +297,8 @@ def test_another_users_ledger_is_not_readable(cfg, client, auth, root_dir):
                     json={"kind": 2, "recipients": [RECIPIENT_A], "max_uses": 1},
                     headers=auth)
     link_uid = r.json()["link_uid"]
-    other = {"Authorization": f"Bearer {_token(cfg, user='someone-else@example.com')}",
+    other = {"Authorization": f"Bearer {_token(cfg, user='someone-else@example.com',
+                                              roles=['users'])}",
              "X-Tenant": TENANT}
     assert client.get(f"/share/v1/links/{link_uid}/redemptions",
                       headers=other).status_code == 404
