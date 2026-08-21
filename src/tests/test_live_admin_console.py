@@ -444,18 +444,26 @@ def test_a_dead_link_lands_in_needs_attention_with_a_reason(client, plain,
 
 # --- drop provenance in the file list (durable marker) --------------------
 
-def _record_drop(conn, cfg, *, link, email, result_uid):
-    """A completed drop, as sessions.record_drop leaves it."""
+def _record_drop(conn, cfg, *, link, email, result_uid, stored_name=""):
+    """A completed drop, through the REAL code path.
+
+    This used to hand-write the redemption row with a result_uid, which is how
+    the per-session/per-file bug survived: the tests never exercised
+    record_drop, so they could not see that it overwrote one column per file.
+    A helper that reproduces production behaviour instead of imitating it is
+    the difference.
+    """
     from share_service import sessions
-    import datetime as dt
     red = str(uuid.uuid4())
     with conn.cursor() as cur:
         cur.execute(
             """INSERT INTO share_redemptions
-                 (redemption_uid, link_uid, expires_at, verified_email, result_uid)
-               VALUES (%s,%s,now() + interval '1 hour',%s,%s)""",
-            (red, link.link_uid, email, result_uid))
+                 (redemption_uid, link_uid, expires_at, verified_email)
+               VALUES (%s,%s,now() + interval '1 hour',%s)""",
+            (red, link.link_uid, email))
     conn.commit()
+    sessions.record_drop(conn, red, link.link_uid, bytes_moved=1,
+                         result_uid=result_uid, stored_name=stored_name)
     return red
 
 
@@ -556,3 +564,90 @@ def test_the_batch_is_capped(client, admin, cfg):
     r = client.post("/share/v1/files/provenance",
                     json={"file_uids": many}, headers=admin)
     assert r.status_code == 200
+
+
+# --- drop provenance is per FILE, not per session -------------------------
+
+def test_every_file_in_a_multi_file_drop_is_marked(cfg, conn):
+    """The reported bug.
+
+    share_redemptions holds ONE result_uid per session and record_drop
+    overwrote it per file, so a session dropping several files left provenance
+    for exactly one — the rest looked like ordinary internal uploads in the
+    file list, which is the opposite of what the marker is for.
+    """
+    from share_service import sessions
+    link, _ = links.create(
+        conn, kind=1, resource_uid=str(uuid.uuid4()), created_by=ADMIN,
+        expires_at=links.clamp_expiry(cfg, None, 1),
+        recipients=["dropper@example.com"], max_uses=5, max_files=10,
+        tenant=TENANT)
+    red = str(uuid.uuid4())
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO share_redemptions
+                 (redemption_uid, link_uid, expires_at, verified_email)
+               VALUES (%s,%s,now() + interval '1 hour',%s)""",
+            (red, link.link_uid, "dropper@example.com"))
+    conn.commit()
+
+    dropped = []
+    for i in range(4):
+        uid = str(uuid.uuid4())
+        dropped.append(uid)
+        sessions.record_drop(conn, red, link.link_uid, bytes_moved=100 + i,
+                             result_uid=uid, stored_name=f"file{i}.bin")
+
+    got = links.provenance_for_files(conn, dropped)
+    assert len(got) == 4, f"only {len(got)} of 4 files carry provenance"
+    for i, uid in enumerate(dropped):
+        assert got[uid]["email"] == "dropper@example.com"
+        assert got[uid]["stored_name"] == f"file{i}.bin"
+
+
+def test_the_session_still_has_one_anchor_file(cfg, conn):
+    """The Share tab's one-click "what did they send us" link still needs a
+    single file. It is now the FIRST rather than the last — a stable anchor,
+    not a value that changes under the reader mid-upload."""
+    from share_service import sessions
+    link, _ = links.create(
+        conn, kind=1, resource_uid=str(uuid.uuid4()), created_by=ADMIN,
+        expires_at=links.clamp_expiry(cfg, None, 1),
+        recipients=["d@example.com"], max_uses=5, max_files=10, tenant=TENANT)
+    red = str(uuid.uuid4())
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO share_redemptions
+                 (redemption_uid, link_uid, expires_at, verified_email)
+               VALUES (%s,%s,now() + interval '1 hour',%s)""",
+            (red, link.link_uid, "d@example.com"))
+    conn.commit()
+    first = str(uuid.uuid4()); second = str(uuid.uuid4())
+    sessions.record_drop(conn, red, link.link_uid, bytes_moved=1, result_uid=first)
+    sessions.record_drop(conn, red, link.link_uid, bytes_moved=2, result_uid=second)
+    rows = links.redemptions(conn, link.link_uid)
+    row = next(r for r in rows if r["redemption_uid"] == red)
+    assert row["result_uid"] == first
+    assert row["files_moved"] == 2
+    assert row["bytes_moved"] == 3
+
+
+def test_a_retried_drop_of_the_same_file_is_idempotent(cfg, conn):
+    """A network retry mid-upload must not crash on the primary key."""
+    from share_service import sessions
+    link, _ = links.create(
+        conn, kind=1, resource_uid=str(uuid.uuid4()), created_by=ADMIN,
+        expires_at=links.clamp_expiry(cfg, None, 1),
+        recipients=["d@example.com"], max_uses=5, max_files=10, tenant=TENANT)
+    red = str(uuid.uuid4())
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO share_redemptions
+                 (redemption_uid, link_uid, expires_at, verified_email)
+               VALUES (%s,%s,now() + interval '1 hour',%s)""",
+            (red, link.link_uid, "d@example.com"))
+    conn.commit()
+    uid = str(uuid.uuid4())
+    sessions.record_drop(conn, red, link.link_uid, bytes_moved=5, result_uid=uid)
+    sessions.record_drop(conn, red, link.link_uid, bytes_moved=5, result_uid=uid)
+    assert len(links.provenance_for_files(conn, [uid])) == 1

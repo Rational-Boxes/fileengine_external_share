@@ -201,6 +201,31 @@ def _ddl(schema: str) -> list[str]:
         f"CREATE INDEX IF NOT EXISTS share_redemptions_result ON {s}.share_redemptions (result_uid) "
         f"    WHERE result_uid IS NOT NULL;",
 
+        # --- share_drops ----------------------------------------------------
+        # ONE ROW PER DROPPED FILE. share_redemptions has a single result_uid
+        # column, which record_drop overwrote on every file — so a session that
+        # dropped five files left provenance for exactly one of them, and the
+        # other four looked like ordinary internal uploads in the file list.
+        #
+        # Provenance is a property of a FILE, not of a session: "who sent us
+        # this?" is asked of a file, months later, by someone who never saw the
+        # session. Modelling it per session was the mistake.
+        #
+        # Keyed on result_uid so the marker survives a move or rename, and so a
+        # re-drop of the same uid cannot double-count.
+        f"""
+        CREATE TABLE IF NOT EXISTS {s}.share_drops (
+            result_uid     UUID PRIMARY KEY,
+            redemption_uid UUID        NOT NULL REFERENCES {s}.share_redemptions(redemption_uid),
+            link_uid       UUID        NOT NULL REFERENCES {s}.share_links(link_uid),
+            stored_name    TEXT,
+            size_bytes     BIGINT      NOT NULL DEFAULT 0,
+            dropped_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        """,
+        f"CREATE INDEX IF NOT EXISTS share_drops_link ON {s}.share_drops (link_uid, dropped_at DESC);",
+        f"CREATE INDEX IF NOT EXISTS share_drops_redemption ON {s}.share_drops (redemption_uid);",
+
         # --- share_link_recipients (spec §5.4) ------------------------------
         # The closed destination set. PII in a tenant schema -- never logged,
         # and subject to the retention window (spec §5.5).
