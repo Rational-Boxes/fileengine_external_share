@@ -461,7 +461,11 @@ def file_provenance(body: ProvenanceRequest, request: Request,
         return {"provenance": {}}
 
     return {"provenance": {
-        uid: {"email": r["email"], "at": r["at"], "shared_by": r["shared_by"]}
+        # `stored_name` is the name the file ARRIVED as. Usually identical to
+        # its current name, and useful exactly when it is not — a collision
+        # renamed it on the way in, or someone renamed it since.
+        uid: {"email": r["email"], "at": r["at"], "shared_by": r["shared_by"],
+              "stored_name": r.get("stored_name")}
         for uid, r in visible.items()}}
 
 

@@ -490,19 +490,24 @@ def provenance_for_files(conn, file_uids) -> dict:
     if not uids:
         return {}
     with conn.cursor() as cur:
+        # From share_drops (one row per FILE), not share_redemptions (one row
+        # per session, with a single result_uid). Reading the session row meant
+        # a multi-file drop marked exactly one of its files and left the rest
+        # looking like ordinary internal uploads.
         cur.execute(
-            """SELECT d.result_uid, d.verified_email, d.opened_at, d.link_uid,
-                      l.created_by
-                 FROM share_redemptions d
-                 JOIN share_links l ON l.link_uid = d.link_uid
-                WHERE d.result_uid = ANY(%s::uuid[])""",
+            """SELECT p.result_uid, d.verified_email, p.dropped_at, p.link_uid,
+                      l.created_by, p.stored_name
+                 FROM share_drops p
+                 JOIN share_redemptions d ON d.redemption_uid = p.redemption_uid
+                 JOIN share_links l ON l.link_uid = p.link_uid
+                WHERE p.result_uid = ANY(%s::uuid[])""",
             (uids,))
         rows = cur.fetchall()
     return {
         # Stringified at the boundary: psycopg returns UUID objects here while
         # the caller's uids are strings, and a mismatch silently matches nothing.
         str(r[0]): {"email": r[1], "at": r[2], "link_uid": str(r[3]),
-                    "shared_by": r[4]}
+                    "shared_by": r[4], "stored_name": r[5]}
         for r in rows
     }
 

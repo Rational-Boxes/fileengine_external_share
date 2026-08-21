@@ -204,21 +204,37 @@ def open_session(conn, cfg: Config, *, link_uid: str, verified_email: str,
 
 
 def record_drop(conn, redemption_uid: str, link_uid: str, *, bytes_moved: int,
-                result_uid: str) -> None:
-    """Account for one delivered file on the session and the link.
+                result_uid: str, stored_name: str = "") -> None:
+    """Account for one delivered file on the session, the link, and per FILE.
 
-    `result_uid` is the last file the session produced -- the Share tab's "what
-    did they send us" link (spec §10.2). `files_moved` counts them all, and the
-    per-file audit event carries each one individually.
+    The per-file row in `share_drops` is what the file-list provenance marker
+    reads. It exists because `share_redemptions.result_uid` is a single column
+    that this function used to OVERWRITE on every file: a session dropping five
+    files left provenance for one of them, and the other four were
+    indistinguishable from ordinary internal uploads.
+
+    `result_uid` on the redemption is kept for the Share tab's one-click "what
+    did they send us" link, and now holds the FIRST file rather than the last —
+    a stable anchor for a session rather than a value that changes under the
+    reader while an upload is still running.
     """
     with conn.cursor() as cur:
         cur.execute(
             """UPDATE share_redemptions
                   SET bytes_moved = bytes_moved + %s,
                       files_moved = files_moved + 1,
-                      result_uid = %s
+                      result_uid = COALESCE(result_uid, %s)
                 WHERE redemption_uid = %s""",
             (bytes_moved, result_uid, redemption_uid))
+        # The per-file record. ON CONFLICT so a retried drop of the same uid is
+        # idempotent rather than a crash mid-upload.
+        cur.execute(
+            """INSERT INTO share_drops
+                 (result_uid, redemption_uid, link_uid, stored_name, size_bytes)
+               VALUES (%s,%s,%s,%s,%s)
+               ON CONFLICT (result_uid) DO NOTHING""",
+            (result_uid, redemption_uid, link_uid, stored_name or None,
+             bytes_moved))
         cur.execute(
             """UPDATE share_links SET bytes_consumed = bytes_consumed + %s
                 WHERE link_uid = %s""",

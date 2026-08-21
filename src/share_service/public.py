@@ -686,7 +686,8 @@ async def drop_file(link_uid: str, request: Request, k: Optional[str] = None,
 
         sessions.record_drop(conn, session["redemption_uid"], link_uid,
                              bytes_moved=result.size_bytes,
-                             result_uid=result.file_uid)
+                             result_uid=result.file_uid,
+                             stored_name=result.stored_name)
         reserved = False          # committed: the slot is now genuinely spent
 
         get_emitter(cfg).emit(

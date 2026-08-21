@@ -207,3 +207,4 @@ def test_locking_one_link_does_not_touch_another(cfg, conn, link):
         _fail(conn, link.link_uid, f"d{i}@example.com", threshold=3)
     assert links.get(conn, link.link_uid).status() == "blocked"
     assert links.get(conn, other.link_uid).status() == "active"
+
