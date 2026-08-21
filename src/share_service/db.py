@@ -21,6 +21,7 @@ and one tenant's rows are unreachable from another's session.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Optional
 
 import psycopg
@@ -44,7 +45,15 @@ def connect(config: Config, readonly: bool = False):
 
 
 # Tenants whose schema has been ensured in this process.
+#
+# Guarded, because provisioning is check-then-act: without the lock two threads
+# arriving together on a cold process both pass the membership check and run the
+# same DDL in separate transactions, which Postgres resolves by killing one with
+# DeadlockDetected. Unlike the sibling services this one already honoured the
+# memo rather than re-provisioning per call, so the window is a cold start
+# only — but a cold start is exactly when several requests arrive at once.
 _provisioned: set[str] = set()
+_provision_lock = threading.Lock()
 
 
 def provision_tenant(config: Config, tenant: str) -> str:
@@ -64,15 +73,17 @@ def connect_for_tenant(config: Config, tenant: str, provision: bool = False,
     cannot write, and the primary keeps the schema in sync.
     """
     conn = psycopg.connect(_dsn(config, readonly))
+    name = schema_name(tenant)
     if provision and not readonly and tenant not in _provisioned:
-        name = ensure_tenant_schema(conn, tenant)
-        # The cross-tenant link directory, ensured alongside the first tenant
-        # schema of the process. Public redemptions need it to know WHICH
-        # tenant a link belongs to before they can look it up at all.
-        ensure_global_directory(conn)
-        _provisioned.add(tenant)
-    else:
-        name = schema_name(tenant)
+        with _provision_lock:
+            if tenant not in _provisioned:   # another thread may have just done it
+                ensure_tenant_schema(conn, tenant)
+                # The cross-tenant link directory, ensured alongside the first
+                # tenant schema of the process. Public redemptions need it to
+                # know WHICH tenant a link belongs to before they can look it
+                # up at all.
+                ensure_global_directory(conn)
+                _provisioned.add(tenant)
     with conn.cursor() as cur:
         cur.execute(f'SET search_path TO "{name}", public')
     return conn

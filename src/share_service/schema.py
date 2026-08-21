@@ -62,8 +62,16 @@ CREATE TABLE IF NOT EXISTS public.share_link_directory (
 
 
 def ensure_global_directory(conn) -> None:
-    """Create the cross-tenant link directory (idempotent)."""
+    """Create the cross-tenant link directory (idempotent).
+
+    Locked on a FIXED key, not a per-tenant one: this table is shared by every
+    tenant, so the first connection for *any* tenant runs this DDL against the
+    same object. A per-tenant key would let two different tenants' first
+    requests collide on it — the one case where keying by tenant would look
+    correct and serialise nothing."""
     with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                    (_PROVISION_LOCK_CLASS, "public.share_link_directory"))
         cur.execute(GLOBAL_DDL)
     conn.commit()
 
@@ -255,11 +263,29 @@ def _ddl(schema: str) -> list[str]:
     ]
 
 
+# Namespace for the provisioning advisory lock — fixed, so these locks cannot
+# collide with any other advisory lock taken on this database.
+_PROVISION_LOCK_CLASS = 0x0D15C
+
+
 def ensure_tenant_schema(conn, tenant: str) -> str:
     """Create the tenant's schema + tables if absent. Idempotent. Returns the
-    schema name."""
+    schema name.
+
+    Serialised across PROCESSES by an advisory lock: idempotent DDL is not the
+    same as concurrency-safe DDL, and two transactions running these statements
+    at once take table locks in interleaved order, which Postgres resolves by
+    killing one with DeadlockDetected. ``db.connect_for_tenant`` holds the
+    matching in-process lock; this covers separate processes, which cannot see
+    each other's memo.
+
+    Transaction-scoped, so the commit below releases it — this must therefore
+    NOT be handed an autocommit connection, or the lock would be dropped before
+    the DDL it guards."""
     name = schema_name(tenant)
     with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                    (_PROVISION_LOCK_CLASS, name))
         for stmt in _ddl(name):
             cur.execute(stmt)
     conn.commit()
