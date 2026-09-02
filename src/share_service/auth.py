@@ -36,6 +36,7 @@ from fastapi import Depends, Header, HTTPException, Request, status
 
 from .config import Config
 from .jwt_verify import identity_from_claims, verify_hs256
+from . import token_revocation
 
 
 @dataclass
@@ -81,6 +82,16 @@ def get_caller(request: Request,
 
     claims = verify_hs256(token, config.jwt_secret)
     if not claims:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token",
+                            headers={"WWW-Authenticate": "Bearer"})
+
+    # The bridge may have revoked this token since it signed it, and a stateless
+    # JWT cannot say so — the signature and exp still check out. Ask the shared
+    # denylist, or a signed-out token goes on working here after the bridge has
+    # begun refusing it. Deliberately the same 401 as an expired token: a caller
+    # holding a revoked token needs to sign in again either way, and the reason
+    # is the bridge's to disclose, not this service's.
+    if not token_revocation.permits(str(claims.get("jti") or "")):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token",
                             headers={"WWW-Authenticate": "Bearer"})
 
