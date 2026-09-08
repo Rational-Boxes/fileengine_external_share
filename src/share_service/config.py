@@ -228,7 +228,25 @@ class Config:
         # Public URLs are built from this. Set it explicitly to move share
         # traffic to a separate download host later without invalidating links
         # already sent (spec §8.3).
+        #
+        # It may carry a `{tenant}` placeholder — `https://{tenant}.example.com`,
+        # or `https://dl.{tenant}.example.com` for that download-host split —
+        # which is substituted with the tenant the link is minted IN. Without
+        # one it is a single fixed origin and EVERY tenant's links land on it,
+        # which is right for a single-tenant deployment and wrong for the rest.
         self.public_base_url = _env("SHARE_PUBLIC_BASE_URL", "")
+
+        # The base domain tenant origins hang off (`<tenant>.<base>`), used to
+        # compose a link's origin when `public_base_url` says nothing about the
+        # tenant. Falls back to the stack-wide BASE_DOMAIN, so the compose
+        # deployment needs no new setting to be correct.
+        #
+        # Without either, a link's origin can only be the request's own Host —
+        # and that is the origin the SPA was LOADED from, which is not the
+        # active tenant: the SPA switches tenant on the X-Tenant header without
+        # navigating (see `share_service.urls`).
+        self.tenant_base_domain = _first("SHARE_TENANT_BASE_DOMAIN",
+                                         "BASE_DOMAIN", "")
 
         self.log_level = _env("SHARE_LOG_LEVEL", "INFO")
 

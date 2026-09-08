@@ -41,6 +41,7 @@ from .auth import Caller, get_caller
 from .config import Config
 from .ldap_roles import LdapUnavailable, UnknownUser, in_share_group
 from .schema import KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD, KIND_UPLOAD, KINDS
+from .urls import tenant_origin
 
 log = logging.getLogger("share_service.api")
 
@@ -169,9 +170,15 @@ class RevokeAllRequest(BaseModel):
     creator: str
 
 
-def _public_url(cfg: Config, request: Request, link_uid: str, secret: str) -> str:
-    base = cfg.public_base_url or str(request.base_url).rstrip("/")
-    return f"{base.rstrip('/')}/s/{link_uid}.{secret}"
+def _public_url(cfg: Config, request: Request, tenant: str,
+                link_uid: str, secret: str) -> str:
+    """The link as the recipient will receive it.
+
+    Built from the tenant the link is minted IN, never from the origin the
+    creating request arrived on — the SPA switches tenant with a header and
+    without navigating, so those routinely disagree (:mod:`share_service.urls`).
+    """
+    return f"{tenant_origin(cfg, request, tenant)}/s/{link_uid}.{secret}"
 
 
 # --- routes ---------------------------------------------------------------
@@ -330,7 +337,7 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
         conn.close()
 
     payload = _link_json(link)
-    payload["url"] = _public_url(cfg, request, link.link_uid, secret)
+    payload["url"] = _public_url(cfg, request, caller.tenant, link.link_uid, secret)
     payload["secret_shown_once"] = True
     if snap is not None:
         # The numbers the creator pastes into their own email (spec §13-R9),

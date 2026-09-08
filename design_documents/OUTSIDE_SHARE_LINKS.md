@@ -1394,7 +1394,8 @@ feature (§4).
 | `share.zip_deflate` | `false` | Compress instead of store — forfeits `Content-Length` and resume-free progress (§6.5). |
 | `share.zip_max_concurrent` | `4` | Simultaneous zip streams per bridge instance. |
 | `share.retention_days` | `365` | How long dead rows — including recipient addresses (PII, §5.4) — are kept for audit (§5.5). |
-| `SHARE_PUBLIC_BASE_URL` | derived from `Host` | The origin URLs are built from at creation. Set explicitly to move share traffic to a separate download host later without invalidating links already sent (§8.3). |
+| `SHARE_PUBLIC_BASE_URL` | derived from `Host` | The origin URLs are built from at creation. May carry a `{tenant}` placeholder (`https://{tenant}.example.com`), substituted with the tenant the link is minted **in**; without one it is a single fixed origin for every tenant. Set explicitly to move share traffic to a separate download host later without invalidating links already sent (§8.3). |
+| `SHARE_TENANT_BASE_DOMAIN` | `BASE_DOMAIN` | The base domain tenant origins hang off, so a link's origin can be composed as `<tenant>.<base>` when `SHARE_PUBLIC_BASE_URL` says nothing about the tenant. Needed because the request's own `Host` is the origin the SPA was **loaded** from, not the active tenant — the SPA switches tenant on an `X-Tenant` header without navigating. |
 
 ---
 
