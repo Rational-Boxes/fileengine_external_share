@@ -42,6 +42,13 @@ USER = "testuser@rationalboxes.com"
 TENANT = "default"
 RECIPIENT_A = "ledger-recipient@example.com"
 
+# The origin a link minted in TENANT must carry. Composed from the TENANT, never
+# from the host the creating request arrived on — TestClient arrives as
+# `testserver`, and in the real stack the SPA arrives on whichever origin it was
+# loaded from, which is not the active tenant once someone has switched (the
+# switch sends X-Tenant without navigating). See `share_service.urls`.
+ORIGIN = f"http://{TENANT}.example.com"
+
 
 def _b64(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
@@ -74,6 +81,12 @@ def cfg() -> Config:
     if not c.jwt_secret:
         pytest.skip("FILEENGINE_JWT_SECRET not configured")
     c.enabled = True          # the deployment kill switch is off by default
+    # Pin where links point, so the URL assertions are about this code and not
+    # about whatever .env the checkout carries — in practice a dev tunnel, a
+    # single fixed origin that answers for every tenant at once and would hide
+    # exactly the bug the assertions exist to catch.
+    c.public_base_url = ""
+    c.tenant_base_domain = "example.com"
     return c
 
 
@@ -112,8 +125,16 @@ def test_create_list_get_revoke(cfg, client, auth, root_dir):
 
     # The secret exists exactly once, in this response (spec §8.2).
     assert created["secret_shown_once"] is True
-    assert "/s/" in created["url"]
     link_uid = created["link_uid"]
+
+    # The URL the creator copies, in full but for the secret: scheme, the
+    # TENANT'S host, and the link it names. Asserting only that "/s/" appears
+    # let a link go out on another tenant's origin and still pass — it stays
+    # redeemable either way, because the public route resolves the tenant from
+    # the cross-tenant directory rather than from the host.
+    assert created["url"].startswith(f"{ORIGIN}/s/{link_uid}."), created["url"]
+    assert "testserver" not in created["url"]
+
     assert created["status"] == "active"
     assert created["resource_uid"] == root_dir
 
