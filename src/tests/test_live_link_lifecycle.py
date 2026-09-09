@@ -281,6 +281,35 @@ def test_recipient_add_and_partial_revoke(cfg, client, auth, root_dir):
     assert removed and removed[0]["status"] == "removed"
 
 
+def test_a_revoked_link_cannot_be_widened(cfg, client, auth, root_dir):
+    """Adding an address to a dead link is refused, not quietly accepted.
+
+    Production, 2026-09-09: a recipient was added 28 seconds after the link was
+    revoked and the call returned 201. The grant was inert — `public.py` gates
+    every redemption on `status() == "active"` — but the roster then listed
+    someone who could not reach the file, and the audit chain carried a
+    `permission` event saying access had been widened when it had not.
+    """
+    r = client.post(f"/share/v1/nodes/{root_dir}/links",
+                    json={"kind": 2, "recipients": ["first@example.com"], "max_uses": 5},
+                    headers=auth)
+    link_uid = r.json()["link_uid"]
+
+    assert client.delete(f"/share/v1/links/{link_uid}", headers=auth).status_code == 200
+
+    r = client.post(f"/share/v1/links/{link_uid}/recipients",
+                    json={"email": "late@example.com"}, headers=auth)
+    assert r.status_code == 409
+    assert r.json()["detail"]["error"] == "link_not_live"
+    assert r.json()["detail"]["status"] == "revoked"
+
+    # And it really did not land — the refusal is the whole point, so assert the
+    # row is absent rather than trusting the status code.
+    roster = client.get(f"/share/v1/links/{link_uid}/recipients?include_removed=true",
+                        headers=auth).json()["recipients"]
+    assert [x["email"] for x in roster] == ["first@example.com"]
+
+
 def test_redemption_ledger_is_readable_by_the_creator(cfg, client, auth, root_dir):
     """"Did they actually get it?" has no other answer when there is no account
     on the far side. Read from this service's own rows, so an ordinary creator
