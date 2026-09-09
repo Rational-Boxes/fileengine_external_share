@@ -694,7 +694,22 @@ def add_recipient(link_uid: str, body: AddRecipientRequest, request: Request,
         # link. Console powers stop at revocation (spec §10.3) - adding an
         # address is a grant of access, the direction oversight is meant to
         # close, not open.
-        _owned_link(conn, link_uid, caller)
+        link = _owned_link(conn, link_uid, caller)
+        # A dead link can never work again, so this would grant nothing — but it
+        # would still write a `permission` audit event saying access was widened
+        # and put the address on a roster the creator reads as "these people can
+        # reach this file". Both would be false, and the audit chain is the only
+        # custodian of the fact that an access was external (spec §11), so a
+        # phantom grant there is the expensive kind. Refuse.
+        #
+        # Measured in production 2026-09-09: an address was added 28 seconds
+        # AFTER the link was revoked, and the call returned 201.
+        if link.is_dead:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                {"error": "link_not_live", "status": link.status(),
+                 "message": f"this link is {link.status()} — it cannot be "
+                            "widened; create a new one instead"})
         if links.count_recipients(conn, link_uid) >= cfg.max_recipients:
             raise HTTPException(status.HTTP_400_BAD_REQUEST,
                                 f"at most {cfg.max_recipients} recipients")

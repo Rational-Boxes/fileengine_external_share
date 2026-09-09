@@ -140,6 +140,21 @@ class Link:
             return "exhausted"
         return "active"
 
+    @property
+    def is_dead(self) -> bool:
+        """Past any state it can come back from.
+
+        `blocked` is deliberately NOT here: a lockout lifts on its own, so a
+        blocked link is a live grant that is merely waiting. The three that are
+        here are one-way — nothing un-revokes a link, time does not run
+        backwards, and `uses_consumed` only climbs.
+
+        Used to refuse *widening* a link that can never work again (spec
+        §6.9): the grant would be inert, but the roster and the audit record
+        would both claim access was given.
+        """
+        return self.status() in ("revoked", "expired", "exhausted")
+
 
 _COLUMNS = """link_uid, kind, resource_uid, created_by, created_at, expires_at,
               revoked_at, revoked_by, max_uses, uses_consumed,
