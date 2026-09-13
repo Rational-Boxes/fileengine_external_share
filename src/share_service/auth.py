@@ -95,10 +95,20 @@ def get_caller(request: Request,
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token",
                             headers={"WWW-Authenticate": "Bearer"})
 
-    got = identity_from_claims(claims, x_tenant or "")
-    if not got:
+    if not claims.get("sub"):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "token carries no subject",
                             headers={"WWW-Authenticate": "Bearer"})
+
+    # Membership is not a header. The token attests the tenants the caller
+    # belongs to; a tenant absent from that map is one they are not a member of,
+    # and asking for it is forbidden rather than unauthenticated. This used to
+    # resolve to an empty role list instead, which authenticated the caller into
+    # another tenant and let the core serve it under read-by-default. Mirrors
+    # the bridge's own 403 on the same condition.
+    got = identity_from_claims(claims, x_tenant or "")
+    if not got:
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "not a member of the requested tenant")
     user, roles = got
     tenant = x_tenant or claims.get("tenant") or "default"
     return Caller(user=user, tenant=tenant, roles=list(roles),
