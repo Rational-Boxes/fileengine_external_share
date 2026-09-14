@@ -33,6 +33,8 @@ import json
 import time
 from typing import Optional
 
+from .tenant_access import scope_claims_to_tenant
+
 
 def _b64url_decode(seg: str) -> bytes:
     seg += "=" * (-len(seg) % 4)
@@ -81,14 +83,7 @@ def verify_hs256(token: str, secret: str, leeway: int = 0) -> Optional[dict]:
 
 
 def identity_from_claims(claims: dict, tenant: str) -> Optional[tuple[str, list[str]]]:
-    """Extract (user, roles) from verified claims, scoping roles to ``tenant``
-    (falling back to the token's default ``tenant`` claim). None if no subject."""
-    user = claims.get("sub")
-    if not user:
-        return None
-    active = tenant or claims.get("tenant") or "default"
-    roles_map = claims.get("roles")
-    roles: list[str] = []
-    if isinstance(roles_map, dict):
-        roles = list(roles_map.get(active) or [])
-    return user, roles
+    """``(user, roles)`` from verified claims, scoped to ``tenant`` — or ``None``
+    if the token does not attest membership of it. See
+    :func:`.tenant_access.scope_claims_to_tenant`."""
+    return scope_claims_to_tenant(claims, tenant)
