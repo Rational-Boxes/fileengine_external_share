@@ -24,10 +24,17 @@ accepts a credential.
 
 **Service principals** are the one deliberate exception. They are
 infrastructure identities (``FILEENGINE_SERVICE_PRINCIPALS``, defaulting to the
-service's own configured agent), not tenant members: they may act in any
-tenant, and they carry **no tenant roles at all**. Their authority over content
-is whatever the core's ACL check grants them on the object in hand — never a
-role, and never ``system_admin``.
+service's own configured agent), so the *admission* test cannot apply to them:
+they may act in a tenant they hold no group in. It stops there. They still get
+exactly the roles they hold IN that tenant — no more, and never a union across
+tenants.
+
+Blanking their roles instead was wrong, and broke production: the workers reach
+the core as this principal, and the directory-wide search had been quietly
+handing them ``system_admin``. Stripping every role turned that into
+``PermissionDenied`` on operations they legitimately perform. The escalation to
+remove was the CROSS-TENANT one; a service account that really is in a tenant's
+group still holds it.
 """
 from __future__ import annotations
 
