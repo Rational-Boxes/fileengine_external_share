@@ -71,6 +71,7 @@ from .ldap_roles import LdapUnavailable, UnknownUser, resolve_share_roles
 from . import notify
 from .notify import get_publisher
 from .schema import KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD, KIND_UPLOAD
+from .tenant_state import TenantStateGate
 
 log = logging.getLogger("share_service.public")
 
@@ -201,6 +202,43 @@ class SessionIn(BaseModel):
 # link resolution
 # --------------------------------------------------------------------------
 
+# ── tenant state (§3.4c) ────────────────────────────────────────────────────
+#
+# A public link is served by this service acting as the link's creator, with no
+# user token anywhere, so the session-expiry argument that covers every other
+# door does not reach it: until 2026-10-01 a suspended tenant's links kept handing
+# out its files. Same rule, cache and fail-closed behaviour as the other doors.
+
+class _CoreTenantState:
+    """GetTenantState via the core, as this service (READ capability)."""
+
+    def __init__(self, cfg: Config):
+        self._cfg = cfg
+
+    def tenant_state(self, tenant: str) -> dict:
+        from fileengine import ManagedFiles
+
+        mf = ManagedFiles(server_address=self._cfg.grpc_address,
+                          user_name="share-service", user_roles=[], tenant=tenant)
+        try:
+            return mf.tenant_state(tenant)
+        finally:
+            try:
+                mf.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+TENANT_GATE = TenantStateGate()
+
+
+def _tenant_admits(cfg: Config, tenant: str) -> bool:
+    if TENANT_GATE._source is None:
+        TENANT_GATE.set_source(_CoreTenantState(cfg))
+    ok, _ = TENANT_GATE.admits(tenant)
+    return ok
+
+
 def _resolve(request: Request, link_uid: str, secret: Optional[str]):
     """(config, tenant, connection, link) for a live link whose secret matches.
 
@@ -255,6 +293,15 @@ def _resolve(request: Request, link_uid: str, secret: Optional[str]):
     if link.status() != "active":
         conn.close()
         _audit_denied(cfg, link_uid=link_uid, reason=link.status(), tenant=tenant,
+                      addr=client_addr(request))
+        raise _deny()
+
+    # The tenant whose schema HELD the link — never just the caller's X-Tenant,
+    # which can only narrow the lookup above. Same uniform 404 as every other
+    # refusal; the audit record carries the reason.
+    if not _tenant_admits(cfg, tenant):
+        conn.close()
+        _audit_denied(cfg, link_uid=link_uid, reason="tenant_not_live", tenant=tenant,
                       addr=client_addr(request))
         raise _deny()
 
