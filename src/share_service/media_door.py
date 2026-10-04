@@ -104,6 +104,13 @@ _EMAIL_RE = re.compile(r"^[^@\s,;<>\"'`=+\x00-\x1f]{1,64}@[A-Za-z0-9.-]{1,253}\.
 
 _DEFAULT_CSP = "default-src 'none'; media-src 'self'; frame-ancestors 'none'"
 
+#: The two exceptions to MIME_ALLOWLIST, each on its own path only.
+EMBED_MIME = frozenset({"text/javascript", "text/css", "application/json"})  # json: the uniform 404
+PLAYER_MIME = frozenset({"text/html", "application/json"})
+_EMBED_DIR = __import__("pathlib").Path(__file__).with_name("embed")
+_EMBED_FILES = {"fe-media-share.js": "text/javascript", "media-share-model.js": "text/javascript",
+                "player.js": "text/javascript", "player.css": "text/css"}
+
 _HARDENING = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
@@ -163,7 +170,15 @@ def install_hardening(app) -> None:
         if not request.url.path.startswith(router.prefix):
             return response
         ctype = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
-        if ctype not in MIME_ALLOWLIST:
+        path = request.url.path
+        # Exactly two exceptions, both our own static files, never content:
+        # the embed script/styles, and the framed player page (§9.2).
+        allowed = MIME_ALLOWLIST
+        if path.startswith(f"{router.prefix}/embed/"):
+            allowed = EMBED_MIME
+        elif path.startswith(f"{router.prefix}/player/"):
+            allowed = PLAYER_MIME
+        if ctype not in allowed:
             log.error("media door refused to emit %r on %s", ctype, request.url.path)
             response = JSONResponse({"error": "internal"}, status_code=500)
         for k, v in _HARDENING.items():
@@ -176,7 +191,8 @@ def install_hardening(app) -> None:
         if "content-security-policy" not in response.headers:
             response.headers["Content-Security-Policy"] = _DEFAULT_CSP
         cc = response.headers.get("cache-control", "")
-        if not (ctype.startswith(("video/", "audio/", "image/")) and cc.startswith("private")):
+        static = path.startswith(f"{router.prefix}/embed/") and cc.startswith("public")
+        if not static and not (ctype.startswith(("video/", "audio/", "image/")) and cc.startswith("private")):
             response.headers["Cache-Control"] = "no-store"
         if response.headers.get("access-control-allow-origin") == "*":
             del response.headers["access-control-allow-origin"]
@@ -252,7 +268,9 @@ def _cors(cfg: Config, request: Request, tenant: str, link) -> dict:
         allowed.add(tenant_origin(cfg, request, tenant).rstrip("/"))
     except Exception:  # noqa: BLE001
         pass
-    if origin.rstrip("/") in allowed:
+    # An open link embeddable anywhere (["*"]) echoes the caller's Origin —
+    # never a literal "*" — so an in-page player on any host can talk to the door.
+    if origin.rstrip("/") in allowed or ("*" in allowed and link.access_mode == ACCESS_OPEN):
         return {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
     return {"Vary": "Origin"}
 
@@ -361,6 +379,93 @@ def _sources(link_uid: str, fmts: dict) -> List[dict]:
 
 # ── routes ─────────────────────────────────────────────────────────────────────
 
+# ── the embed (§9) ─────────────────────────────────────────────────────────────
+
+@router.get("/embed/{name}")
+def embed_asset(name: str):
+    """The embed script (vendored from commercial_embedding, kept identical by a
+    test) and the player page's assets. Fixed names only; nothing caller-chosen
+    reaches the filesystem."""
+    ctype = _EMBED_FILES.get(name)
+    if not ctype:
+        raise _deny()
+    return Response((_EMBED_DIR / name).read_bytes(), media_type=ctype,
+                    headers={"Cache-Control": "public, max-age=300",
+                             # Hosts load the script cross-origin as a module.
+                             "Access-Control-Allow-Origin": "*",
+                             "Cross-Origin-Resource-Policy": "cross-origin"})
+
+
+def _player_csp(link) -> str:
+    anc = " ".join(link.allowed_embed_origins or []) if link else ""
+    return ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
+            "media-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; "
+            f"frame-ancestors {anc or chr(39) + 'none' + chr(39)}")
+
+
+@router.get("/player/{link_uid}")
+def player(link_uid: str, request: Request, k: Optional[str] = None):
+    """The page a GATED embed frames: the gate on our origin, under our CSP.
+    frame-ancestors is the link's own allowlist — the enforcement (§9.3); a link
+    with none cannot be framed at all. The server fills two meta tags with data
+    (the link uid, the allowlist), never script."""
+    import html as _html
+    try:
+        cfg, tenant, conn, link = _resolve(request, link_uid, k)
+        conn.close()
+    except HTTPException:
+        return Response("<!doctype html><title>Not available</title>"
+                        "<p>This link isn't available.</p>", status_code=404,
+                        media_type="text/html",
+                        headers={"Content-Security-Policy": _player_csp(None)})
+    page = (_EMBED_DIR / "player.html").read_text()
+    page = page.replace("{{LINK}}", _html.escape(link.link_uid, quote=True)).replace(
+        "{{ORIGINS}}", _html.escape(json.dumps(link.allowed_embed_origins or []), quote=True))
+    return Response(page, media_type="text/html",
+                    headers={"Content-Security-Policy": _player_csp(link)})
+
+
+_OEMBED_UID = re.compile(r"/(?:media/v1/|s/)([0-9a-fA-F-]{36})")
+
+
+@router.get("/oembed")
+def oembed(request: Request, url: str, maxwidth: int = 720, maxheight: int = 0,
+           format: str = "json"):
+    """oEmbed (§9.1): paste the link into WordPress, Notion and the rest. Only a
+    link that may be embedded somewhere answers; the rest get the uniform 404."""
+    import html as _html
+    from urllib.parse import parse_qs, urlsplit
+    if format != "json":
+        raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, {"error": "json only"})
+    u = urlsplit(url)
+    m = _OEMBED_UID.search(u.path)
+    if not m:
+        raise _deny()
+    link_uid = m.group(1)
+    secret = (parse_qs(u.query).get("k") or [""])[0] or (
+        u.path.rsplit(".", 1)[-1] if "/s/" in u.path else "")
+    cfg, tenant, conn, link = _resolve(request, link_uid, secret)
+    conn.close()
+    if not link.allowed_embed_origins:
+        raise _deny()
+    from .urls import media_origin
+    origin = media_origin(cfg, request, tenant) or str(request.base_url).rstrip("/")
+    w = max(200, min(int(maxwidth or 720), 1920))
+    h = int(maxheight) if maxheight else round(w * 9 / 16)
+    src = f"{origin}/media/v1/player/{link.link_uid}?k={secret}"
+    payload = {
+        "version": "1.0", "type": "video", "provider_name": "FileEngine",
+        "title": link.display_name or "Shared video", "width": w, "height": h,
+        "html": (f'<iframe src="{_html.escape(src, quote=True)}" width="{w}" height="{h}" '
+                 'style="border:0" allow="autoplay; fullscreen; picture-in-picture" '
+                 f'title="{_html.escape(link.display_name or "Video", quote=True)}"></iframe>'),
+    }
+    if link.poster_uid:
+        payload["thumbnail_url"] = f"{origin}/media/v1/{link.link_uid}/poster?k={secret}"
+    return _json(payload)
+
+
+# Registered BEFORE /{link_uid}: a literal path must win over the link's peek.
 @router.get("/{link_uid}")
 def peek(link_uid: str, request: Request, k: Optional[str] = None,
          x_share_secret: Optional[str] = Header(default=None)) -> Response:

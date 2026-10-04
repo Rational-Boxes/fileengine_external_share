@@ -315,6 +315,9 @@ class Config:
         self.audience_csv_enabled = _bool("SHARE_AUDIENCE_CSV_ENABLED", True)
         self.audience_csv_interval_seconds = _int("SHARE_AUDIENCE_CSV_INTERVAL_SECONDS", 300)
         self.audience_csv_per_link_max = _int("SHARE_AUDIENCE_CSV_PER_LINK_MAX", 10)
+        # Dev and tests ONLY: admit http://localhost / 127.0.0.1 embed origins, so
+        # a local host page can embed without a certificate. Never in production.
+        self.media_embed_allow_loopback = _bool("SHARE_MEDIA_EMBED_ALLOW_LOOPBACK", False)
         # /claim is a free write endpoint for anyone holding the URL (§7.3).
         self.claim_rate_per_hour = _int("SHARE_CLAIM_RATE_PER_HOUR", 10)
 

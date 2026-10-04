@@ -93,22 +93,36 @@ OPEN_LINK_WARNING = ("anyone with this link, and anyone they forward it to, "
                      "can watch this")
 
 
-def _embed_origins(raw: Optional[List[str]]) -> Optional[List[str]]:
+def _embed_origins(raw: Optional[List[str]], *, mode: str = ACCESS_VERIFIED,
+                   cfg: Optional[Config] = None) -> Optional[List[str]]:
     """Normalize to bare https origins (scheme://host[:port]). Anything else —
-    a path, a wildcard, http — is refused rather than trimmed: this list becomes
-    frame-ancestors, and a silently widened CSP is the failure to avoid."""
+    a path, a partial wildcard, http — is refused rather than trimmed: this list
+    becomes frame-ancestors, and a silently widened CSP is the failure to avoid.
+
+    Exactly ``["*"]`` (embeddable anywhere — what WordPress/Notion oEmbed needs)
+    is accepted for an OPEN link only (§9.3), which already carries the
+    confirm_public acknowledgement. ``http://localhost`` / ``127.0.0.1`` origins
+    are accepted only with SHARE_MEDIA_EMBED_ALLOW_LOOPBACK (dev and tests)."""
     from urllib.parse import urlsplit
     if not raw:
         return None
+    if [o.strip() for o in raw] == ["*"]:
+        if mode != ACCESS_OPEN:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                "allowed_embed_origins '*' is only for an open link")
+        return ["*"]
+    loopback_ok = bool(cfg and cfg.media_embed_allow_loopback)
     out: List[str] = []
     for o in raw:
         o = (o or "").strip()
         u = urlsplit(o)
-        if (u.scheme != "https" or not u.hostname or "*" in o or u.username
+        loopback = (u.scheme == "http" and loopback_ok
+                    and (u.hostname or "") in ("localhost", "127.0.0.1"))
+        if ((u.scheme != "https" and not loopback) or not u.hostname or "*" in o or u.username
                 or u.path not in ("", "/") or u.query or u.fragment):
             raise HTTPException(status.HTTP_400_BAD_REQUEST,
                                 f"allowed_embed_origins: {o!r} is not an https origin")
-        origin = f"https://{u.hostname.lower()}" + (f":{u.port}" if u.port else "")
+        origin = f"{u.scheme}://{u.hostname.lower()}" + (f":{u.port}" if u.port else "")
         if origin not in out:
             out.append(origin)
     return out
@@ -384,7 +398,8 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
                             "a media link is limited by max_viewers and max_bytes, not max_uses")
     if body.max_viewers < 0:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "max_viewers must be 0 or more")
-    embed_origins = _embed_origins(body.allowed_embed_origins) if is_media else None
+    embed_origins = (_embed_origins(body.allowed_embed_origins, mode=mode, cfg=cfg)
+                     if is_media else None)
     # The public title (§6.8). Defaulting it to the file name would publish
     # whatever the internal naming says — "ACME-Q3-teardown-CONFIDENTIAL-v4" —
     # so an OPEN link must be given one; the others default below.

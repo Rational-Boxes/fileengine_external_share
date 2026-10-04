@@ -34,5 +34,10 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The media origin's own static assets: the embed script (vendored from
+# commercial_embedding, kept in step by a test) and the iframe player page.
+[tool.setuptools.package-data]
+share_service = ["embed/*"]
+
 [tool.pytest.ini_options]
 markers = ["live: integration test that needs LDAP + the gRPC core + Postgres + Redis reachable"]

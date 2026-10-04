@@ -1,0 +1,21 @@
+<!doctype html>
+<!--
+  The media origin's player page — what a GATED embed frames (MEDIA_SHARE.md
+  §9.2). The gate lives here, on our origin, under our CSP, where the host page
+  can neither read what is typed nor forge it. Static: the server fills only the
+  two meta tags below (data, never script — CSP forbids inline script).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="fe-link" content="{{LINK}}">
+  <meta name="fe-embed-origins" content="{{ORIGINS}}">
+  <title>Shared video</title>
+  <link rel="stylesheet" href="/media/v1/embed/player.css">
+</head>
+<body>
+  <main id="app" class="fp"><p class="fp-small">Loading…</p></main>
+  <script type="module" src="/media/v1/embed/player.js"></script>
+</body>
+</html>

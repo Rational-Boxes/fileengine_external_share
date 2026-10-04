@@ -604,3 +604,19 @@ def test_download_defaults_by_mode(world, conn):
     assert _create(world).json()["allow_download"] is True                      # verified
     assert _create(world, access_mode="claimed").json()["allow_download"] is False
     assert _create(world, access_mode="claimed", allow_download=True).json()["allow_download"] is True
+
+
+def test_embed_anywhere_is_for_open_links_only(world, cfg, conn):
+    assert _create(world, access_mode="claimed", allowed_embed_origins=["*"]).status_code == 400
+    r = _create(world, access_mode="open", recipients=[], confirm_public=True,
+                display_name="Tour", allowed_embed_origins=["*"])
+    assert r.status_code == 201 and r.json()["allowed_embed_origins"] == ["*"]
+    assert _create(world, allowed_embed_origins=["*", "https://a.example"]).status_code == 400
+
+
+def test_loopback_embed_origins_only_when_enabled(world, cfg, conn):
+    assert _create(world, allowed_embed_origins=["http://localhost:8790"]).status_code == 400
+    cfg.media_embed_allow_loopback = True
+    r = _create(world, allowed_embed_origins=["http://localhost:8790"])
+    assert r.status_code == 201 and r.json()["allowed_embed_origins"] == ["http://localhost:8790"]
+    assert _create(world, allowed_embed_origins=["http://evil.example"]).status_code == 400

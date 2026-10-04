@@ -732,3 +732,80 @@ def test_a_poster_fetch_is_never_counted_as_a_view(w):
     assert _row(w, "SELECT count(*) FROM share_media_sessions WHERE link_uid = %s", link)[0] == 0
     assert _row(w, "SELECT count(*) FROM share_link_audience WHERE link_uid = %s", link)[0] == 0
     assert w.em.actions() == before
+
+
+# ── MS8: the embed — script, player page, oEmbed (§9) ─────────────────────────────
+
+def test_the_embed_script_is_served_as_javascript_and_nothing_else_is(w):
+    r = w.client.get("/media/v1/embed/fe-media-share.js")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/javascript")
+    assert r.headers["x-content-type-options"] == "nosniff"
+    assert r.headers["cache-control"].startswith("public")
+    assert "customElements" in r.text or "defineFeMediaShare" in r.text
+    for bad in ("../app.py", "nope.js", "%2e%2e%2fapp.py", "player.html"):
+        assert w.client.get(f"/media/v1/embed/{bad}").status_code == 404
+
+
+def test_the_served_script_is_the_kit_component_verbatim():
+    """share_service serves a VENDORED copy of commercial_embedding's component;
+    this keeps the two identical (skipped where the sibling repo is absent)."""
+    import pathlib
+    here = pathlib.Path(__file__).resolve()
+    kit = here.parents[3] / "commercial_embedding" / "packages" / "components" / "src"
+    if not kit.is_dir():
+        pytest.skip("commercial_embedding not checked out beside share_service")
+    ours = here.parents[1] / "share_service" / "embed"
+    for name in ("fe-media-share.js", "media-share-model.js"):
+        assert (ours / name).read_bytes() == (kit / name).read_bytes(), f"{name} drifted from the kit"
+
+
+def test_the_player_page_is_framable_only_by_the_links_allowlist(w):
+    link, secret = _mint(w, "claimed", allowed_embed_origins=["https://client.example"])
+    r = w.client.get(f"/media/v1/player/{link}?k={secret}")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
+    csp = r.headers["content-security-policy"]
+    assert "frame-ancestors https://client.example" in csp
+    assert "script-src 'self'" in csp and "unsafe-inline" not in csp
+    assert f'name="fe-link" content="{link}"' in r.text
+    assert "https://client.example" in r.text                  # the data meta tag
+    assert "<script>" not in r.text                            # no inline script at all
+    none_link, s2 = _mint(w, "claimed")
+    assert "frame-ancestors 'none'" in w.client.get(
+        f"/media/v1/player/{none_link}?k={s2}").headers["content-security-policy"]
+    bad = w.client.get(f"/media/v1/player/{link}?k=wrong")
+    assert bad.status_code == 404 and "frame-ancestors 'none'" in bad.headers["content-security-policy"]
+
+
+def test_html_is_still_refused_everywhere_but_the_player(w):
+    link, _s, s = _session(w)
+    assert _get(w, link, s["session"]).headers["content-type"] == "video/webm"
+    assert w.client.get(f"/media/v1/{link}?k=x").headers["content-type"].startswith("application/json")
+
+
+def test_oembed_returns_an_iframe_for_an_embeddable_link_only(w):
+    w.cfg.media_base_url = "https://{tenant}-media.example.com"
+    link, secret = _mint(w, "claimed", allowed_embed_origins=["https://client.example"])
+    url = f"https://default-media.example.com/media/v1/{link}?k={secret}"
+    r = w.client.get("/media/v1/oembed", params={"url": url, "maxwidth": 640})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["type"] == "video" and body["version"] == "1.0" and body["width"] == 640
+    assert f"https://default-media.example.com/media/v1/player/{link}?k={secret}" in body["html"]
+    assert body["html"].startswith("<iframe") and "Walkthrough" in body["title"]
+    assert body["thumbnail_url"].endswith(f"/media/v1/{link}/poster?k={secret}")
+    # The /s/ form works too.
+    assert w.client.get("/media/v1/oembed", params={
+        "url": f"https://acme.example.com/s/{link}.{secret}"}).status_code == 200
+    # No allowlist: not embeddable, so no oEmbed.
+    plain, s2 = _mint(w, "claimed")
+    assert w.client.get("/media/v1/oembed", params={
+        "url": f"https://m/media/v1/{plain}?k={s2}"}).status_code == 404
+    assert w.client.get("/media/v1/oembed", params={"url": url.replace(secret, "x")}).status_code == 404
+
+
+def test_an_open_link_embeddable_anywhere_echoes_the_origin_never_star(w):
+    link, secret = _mint(w, "open", allowed_embed_origins=["*"])
+    r = w.client.get(f"/media/v1/{link}?k={secret}", headers={"Origin": "https://anyone.example"})
+    assert r.headers["access-control-allow-origin"] == "https://anyone.example"
+    assert "frame-ancestors *" in w.client.get(
+        f"/media/v1/player/{link}?k={secret}").headers["content-security-policy"]
