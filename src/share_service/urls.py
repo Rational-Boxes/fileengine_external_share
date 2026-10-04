@@ -118,3 +118,24 @@ def tenant_origin(cfg: Any, request: Any, tenant: str) -> str:
                 "tenant's origin: set SHARE_TENANT_BASE_DOMAIN, or put a "
                 "{tenant} placeholder in SHARE_PUBLIC_BASE_URL", tenant, fallback)
     return fallback
+
+
+def media_origin(cfg: Any, request: Any, tenant: str) -> str:
+    """The media origin for ``tenant`` (MEDIA_SHARE.md §6.5) — never the tenant
+    origin: the media door is the one place that answers with a real media type,
+    so it must not share an origin with anything holding a credential.
+
+    ``SHARE_MEDIA_BASE_URL`` (may carry ``{tenant}``) wins; otherwise
+    ``<tenant>-media.<base>``; with neither, "" — and the caller offers no
+    media URL rather than one on the wrong origin."""
+    configured = (getattr(cfg, "media_base_url", "") or "").strip().rstrip("/")
+    label = (tenant or "").strip().lower()
+    if not _LABEL.match(label):
+        return ""
+    if configured:
+        return configured.replace(_PLACEHOLDER, label)
+    base_domain = (getattr(cfg, "tenant_base_domain", "") or "").strip().strip(".")
+    if base_domain:
+        scheme = _request_origin(request).partition("://")[0] or "https"
+        return f"{scheme}://{label}-media.{base_domain}"
+    return ""

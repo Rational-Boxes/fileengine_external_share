@@ -43,7 +43,7 @@ from .ldap_roles import LdapUnavailable, UnknownUser, in_open_group, in_share_gr
 from .schema import (ACCESS_MODES, ACCESS_OPEN, ACCESS_VERIFIED,
                      KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD, KIND_MEDIA, KIND_UPLOAD,
                      KINDS, MEDIA_PENDING, MEDIA_READY)
-from .urls import tenant_origin
+from .urls import media_origin, tenant_origin
 
 log = logging.getLogger("share_service.api")
 
@@ -516,6 +516,13 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
 
     payload = _link_json(link)
     payload["url"] = _public_url(cfg, request, caller.tenant, link.link_uid, secret)
+    if link.kind == KIND_MEDIA:
+        # The media door's own address, for an embed (MEDIA_SHARE.md §9). Carries
+        # the secret like the landing URL does; absent when no media origin is
+        # configured rather than pointing at the wrong one.
+        origin = media_origin(cfg, request, caller.tenant)
+        if origin:
+            payload["media_url"] = f"{origin}/media/v1/{link.link_uid}?k={secret}"
     payload["secret_shown_once"] = True
     if snap is not None:
         # The numbers the creator pastes into their own email (spec §13-R9),

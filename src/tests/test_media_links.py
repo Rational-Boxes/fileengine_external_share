@@ -71,6 +71,8 @@ def cfg() -> Config:
     c.media_enabled = True
     c.allow_open_mode = True
     c.media_internal_secret = SECRET
+    c.media_base_url = ""
+    c.tenant_base_domain = "example.com"
     return c
 
 
@@ -178,6 +180,8 @@ def test_a_verified_media_link_on_a_published_file_is_ready_and_described(world,
     assert b["output_bytes"] == 22_000_000 and b["poster_uid"] == POSTER
     assert b["allowed_embed_origins"] == ["https://client.example"]
     assert b["display_name"] == "Welcome" and b["max_uses"] == 0
+    # The embed address is on the MEDIA origin, never the tenant's.
+    assert "-media." in b["media_url"] and "/media/v1/" + b["link_uid"] + "?k=" in b["media_url"]
     assert world.published == []                 # nothing to publish
     assert world.em.events[-1]["detail"]["access_mode"] == "verified"
 
