@@ -564,10 +564,17 @@ async def claim(link_uid: str, request: Request, k: Optional[str] = None,
 async def session(link_uid: str, request: Request, k: Optional[str] = None,
                   x_share_secret: Optional[str] = Header(default=None),
                   x_recipient_token: Optional[str] = Header(default=None)) -> Response:
-    """``verified`` (with the recipient token from /verify) or ``open``."""
+    """``verified`` (with the recipient token from /verify) or ``open``.
+
+    The token travels in the BODY. As a header it made the call non-simple, the
+    browser preflighted it, and this door has no OPTIONS: production
+    2026-10-04, a correct code ended in "could not reach the video service".
+    Every door call stays a text/plain POST so none is ever preflighted. The
+    header is still read, for a page loaded before this change."""
     body = await _body(request)
+    token = str(body.get("recipient_token") or "") or (x_recipient_token or "")
     return await run_in_threadpool(_session, link_uid, request, x_share_secret or k,
-                                   x_recipient_token or "", body)
+                                   token, body)
 
 
 def _claim(link_uid: str, request: Request, secret: Optional[str], body: dict) -> Response:

@@ -624,6 +624,26 @@ def test_verified_needs_the_recipient_token(w):
         f"share:{link}|v@example.com"
 
 
+def test_the_recipient_token_rides_in_the_body_so_no_preflight_is_needed(w):
+    # Production 2026-10-04: as a header it made the session call non-simple; the
+    # browser preflighted it, the door answered OPTIONS with 405, and a correct
+    # code ended in "could not reach the video service". The page now sends a
+    # text/plain POST with the token in the body.
+    link, secret = _mint(w, "verified", recipients=["v@example.com"],
+                         allowed_embed_origins=["https://tenant.example"])
+    simple = {"Content-Type": "text/plain", "Origin": "https://tenant.example"}
+    post = lambda body: w.client.post(f"/media/v1/{link}/session?k={secret}", headers=simple,
+                                      content=__import__("json").dumps(body))
+    assert post({"email": "v@example.com", "recipient_token": "forged"}).status_code == 404
+    ok = post({"email": "v@example.com", "recipient_token": "good-token"})
+    assert ok.status_code == 200 and ok.json()["session"]
+    assert ok.headers["access-control-allow-origin"] == "https://tenant.example"
+    # The legacy header is still honoured, for a page loaded before the change.
+    old = w.client.post(f"/media/v1/{link}/session?k={secret}", json={"email": "v@example.com"},
+                        headers={"X-Recipient-Token": "good-token"})
+    assert old.status_code == 200
+
+
 def test_max_viewers_counts_people_not_sessions(w):
     link, secret = _mint(w, "claimed", max_viewers=1)
     assert _claim(w, link, secret, email="a@example.com").status_code == 200

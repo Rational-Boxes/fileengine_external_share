@@ -146,7 +146,8 @@ async function main() {
   const step2 = el('form', { onsubmit: async (e) => { e.preventDefault(); err.textContent = ''
     const v = await api('/verify', { email: email.value.trim().toLowerCase(), code: code.value.trim() })
     if (v.status !== 200 || !v.data.ok) { err.textContent = v.data?.locked ? 'Too many attempts — try later.' : 'That code was not right.'; return }
-    await session(peek, '/session', { email: email.value.trim().toLowerCase() }, { 'X-Recipient-Token': v.data.recipient_token }) } },
+    // In the body, not a header: a custom header is a CORS preflight the door does not answer.
+    await session(peek, '/session', { email: email.value.trim().toLowerCase(), recipient_token: v.data.recipient_token }) } },
     el('p', {}, 'If that address is on this link, a code is on its way.'), el('label', {}, 'Six-digit code', code), err,
     el('button', { type: 'submit' }, 'Continue'))
   const step1 = el('form', { onsubmit: async (e) => { e.preventDefault()
