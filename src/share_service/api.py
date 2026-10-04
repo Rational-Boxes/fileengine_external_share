@@ -288,6 +288,21 @@ def _resolve_media(cfg: Config, request: Request, caller: Caller, resource_uid: 
     return {"media_state": MEDIA_PENDING}
 
 
+@router.get("/capabilities")
+def capabilities(request: Request, caller: Caller = Depends(get_caller)) -> dict:
+    """What this deployment's share links can do, so the Share tab offers only
+    what will work (MEDIA_SHARE.md §10). `open_mode` is the deployment switch
+    only — whether THIS caller may mint one also needs the share_public group,
+    which the create call checks and explains."""
+    cfg = _config(request)
+    return {"enabled": bool(cfg.enabled),
+            "media": {"available": bool(cfg.enabled and cfg.media_enabled),
+                      "open_mode": bool(cfg.allow_open_mode),
+                      "playback_tracking": bool(cfg.playback_tracking),
+                      "max_bytes": cfg.media_max_bytes,
+                      "default_max_bytes": cfg.media_default_max_bytes}}
+
+
 @router.post("/nodes/{resource_uid}/links", status_code=status.HTTP_201_CREATED)
 def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
                 caller: Caller = Depends(get_caller)) -> dict:

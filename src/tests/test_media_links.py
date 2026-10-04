@@ -589,3 +589,12 @@ def test_readiness_follows_the_primary_profile():
     audio = _state("succeeded", profile="audio-mp3")
     assert audio.ready
     assert not _state("succeeded", profile="video-480p-vp9").ready   # not the primary
+
+
+def test_capabilities_say_what_the_share_tab_may_offer(world, cfg):
+    got = world.client.get("/share/v1/capabilities", headers=world.auth).json()
+    assert got["media"]["available"] is True and got["media"]["open_mode"] is True
+    cfg.media_enabled = False
+    assert world.client.get("/share/v1/capabilities",
+                            headers=world.auth).json()["media"]["available"] is False
+    assert world.client.get("/share/v1/capabilities").status_code == 401
