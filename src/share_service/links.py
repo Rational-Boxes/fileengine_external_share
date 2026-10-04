@@ -34,7 +34,7 @@ import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, List, Optional
+from typing import Any, Iterable, List, Optional, Tuple
 
 from .config import Config
 from .schema import KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD, KIND_UPLOAD
@@ -310,6 +310,25 @@ def list_for_creator(conn, created_by: str, live_only: bool = True) -> List[Link
         return [_row_to_link(r) for r in cur.fetchall()]
 
 
+# Link.status() as SQL predicates, in the same precedence: revoked beats expired
+# beats blocked beats exhausted. Used to SELECT rows; the badge each row shows is
+# still Link.status(), and test_status_sql_matches_link_status keeps the two in
+# step — the property the Python-only filter was protecting.
+_STATUS_SQL = {
+    "revoked": "l.revoked_at IS NOT NULL",
+    "expired": "l.revoked_at IS NULL AND l.expires_at <= now()",
+    "blocked": ("l.revoked_at IS NULL AND l.expires_at > now() "
+                "AND l.locked_until IS NOT NULL AND l.locked_until > now()"),
+    "exhausted": ("l.revoked_at IS NULL AND l.expires_at > now() "
+                  "AND (l.locked_until IS NULL OR l.locked_until <= now()) "
+                  "AND l.max_uses > 0 AND l.uses_consumed >= l.max_uses"),
+    "active": ("l.revoked_at IS NULL AND l.expires_at > now() "
+               "AND (l.locked_until IS NULL OR l.locked_until <= now()) "
+               "AND NOT (l.max_uses > 0 AND l.uses_consumed >= l.max_uses)"),
+}
+STATUSES = tuple(_STATUS_SQL)
+
+
 def list_for_tenant(conn, *, live_only: bool = True, creator: str = "",
                     recipient: str = "", subtree: str = "", status: str = "",
                     limit: int = 500) -> List[dict]:
@@ -328,6 +347,14 @@ def list_for_tenant(conn, *, live_only: bool = True, creator: str = "",
     params: List[Any] = []
     if live_only:
         where.append("l.revoked_at IS NULL AND l.expires_at > now()")
+    if status:
+        # In the WHERE clause, BEFORE the row cap. Filtering after it (as this
+        # did) looked for revoked links only among the 500 riskiest rows —
+        # mostly active ones — so past the cap they vanished, and when the
+        # filter emptied the page the response even said "not truncated".
+        if status not in _STATUS_SQL:
+            raise ValueError(f"unknown status {status!r}")
+        where.append(f"({_STATUS_SQL[status]})")
     if creator:
         where.append("lower(l.created_by) = lower(%s)")
         params.append(creator)
@@ -386,10 +413,9 @@ def list_for_tenant(conn, *, live_only: bool = True, creator: str = "",
     n = len(_COLUMNS.split(","))
     for r in rows:
         link = _row_to_link(r[:n])
-        # `status` is computed in Python, not SQL, so the console and the
-        # owner-side Share tab cannot drift apart on what "expired" means.
-        if status and link.status() != status:
-            continue
+        # The BADGE is still Link.status(), so the console and the owner-side
+        # Share tab cannot disagree on what "expired" means; the SQL above only
+        # chose the rows, and the parity test holds the two definitions equal.
         out.append({"link": link, "recipient_count": r[n],
                     "last_activity": r[n + 1], "truncated": truncated})
     return out
@@ -527,23 +553,27 @@ def provenance_for_files(conn, file_uids) -> dict:
     }
 
 
-def revoke_all_for_creator(conn, created_by: str, revoked_by: str) -> List[str]:
+def revoke_all_for_creator(conn, created_by: str,
+                           revoked_by: str) -> List[Tuple[str, str]]:
     """The departed-employee action: end every live link one person left open.
 
-    Returns the uids actually revoked, so the caller can audit each one
-    individually — a single "revoked 14 links" event is not a record anyone can
-    later answer questions from.
+    Returns ``(link_uid, resource_uid)`` for each link actually revoked, so the
+    caller can audit each one individually — a single "revoked 14 links" event
+    is not a record anyone can later answer questions from. The resource comes
+    back from the UPDATE itself rather than from a read beforehand: a capped
+    pre-read lost the file for every link past the cap, and any link minted
+    between the read and the update was revoked with no file recorded at all.
     """
     with conn.cursor() as cur:
         cur.execute(
             """UPDATE share_links SET revoked_at = now(), revoked_by = %s
                 WHERE lower(created_by) = lower(%s)
                   AND revoked_at IS NULL AND expires_at > now()
-             RETURNING link_uid""",
+             RETURNING link_uid, resource_uid""",
             (revoked_by, created_by))
-        uids = [str(r[0]) for r in cur.fetchall()]
+        rows = [(str(r[0]), str(r[1]) if r[1] else "") for r in cur.fetchall()]
     conn.commit()
-    return uids
+    return rows
 
 
 def recipients(conn, link_uid: str, include_removed: bool = False) -> List[dict]:

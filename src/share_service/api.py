@@ -385,9 +385,15 @@ def list_my_links(request: Request, live: bool = True, all: bool = False,
             return {"links": [_link_json(l) for l in found]}
 
         _require_admin(cfg, caller)
-        rows = links.list_for_tenant(
-            conn, live_only=live, creator=creator, recipient=recipient,
-            subtree=subtree, status=status_filter)
+        try:
+            rows = links.list_for_tenant(
+                conn, live_only=live, creator=creator, recipient=recipient,
+                subtree=subtree, status=status_filter)
+        except ValueError as e:
+            # An unknown status used to come back as an empty list — which a
+            # console reads as "nothing matches".
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                f"{e}; one of {', '.join(links.STATUSES)}")
     finally:
         conn.close()
 
@@ -546,23 +552,19 @@ def admin_revoke_all(body: RevokeAllRequest, request: Request,
 
     conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
     try:
-        # Read the rows BEFORE revoking: the audit event wants each link's
-        # resource_uid, and after the update they no longer match "live".
-        doomed = {r["link"].link_uid: r["link"]
-                  for r in links.list_for_tenant(conn, live_only=True,
-                                                 creator=target, limit=10000)}
+        # Each row carries its resource_uid straight from the UPDATE, so the
+        # audit trail names the file for every link, however many there are.
         revoked = links.revoke_all_for_creator(conn, target, caller.user)
     finally:
         conn.close()
 
     unaudited = []
-    for uid in revoked:
-        link = doomed.get(uid)
+    for uid, resource_uid in revoked:
         try:
             get_emitter(cfg).emit_or_raise(
                 action="share_link_revoke", outcome="ok", category="permission",
                 actor=caller.user, tenant=caller.tenant,
-                target_uid=link.resource_uid if link else "",
+                target_uid=resource_uid,
                 source_addr=caller.source_addr, request_id=uid,
                 detail={"link_uid": uid, "creator": target,
                         "by": "admin_revoke_all"})
@@ -576,7 +578,8 @@ def admin_revoke_all(body: RevokeAllRequest, request: Request,
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
                             f"{len(revoked)} links revoked, but {len(unaudited)} "
                             "audit records could not be written — report this")
-    return {"creator": target, "revoked": len(revoked), "link_uids": revoked}
+    return {"creator": target, "revoked": len(revoked),
+            "link_uids": [uid for uid, _ in revoked]}
 
 
 @router.get("/links/{link_uid}")

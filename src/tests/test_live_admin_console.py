@@ -322,6 +322,38 @@ def test_revoke_all_ends_one_creators_live_links_and_nobody_elses(client, admin,
     assert not links.get(conn, bystander.link_uid).is_revoked
 
 
+def test_revoke_all_audits_the_file_for_every_link_however_many(
+        client, admin, cfg, conn, monkeypatch):
+    """Each audit record names the file its link pointed to — for every link.
+
+    The resources used to come from a read capped at 10,000 rows taken before
+    the revoke, so past the cap (simulated here with a cap of 1) a link was
+    revoked and audited with no file at all. The UPDATE now returns them.
+    """
+    from share_service import api
+    leaver = f"leaver-{uuid.uuid4().hex[:8]}@rationalboxes.com"
+    minted = {l.link_uid: l.resource_uid
+              for l in (_mint(cfg, conn, created_by=leaver) for _ in range(3))}
+
+    real_list = links.list_for_tenant
+    monkeypatch.setattr(links, "list_for_tenant",
+                        lambda conn, **kw: real_list(conn, **{**kw, "limit": 1}))
+    events = []
+
+    class _Capture:
+        def emit_or_raise(self, **kw):
+            events.append(kw)
+
+    monkeypatch.setattr(api, "get_emitter", lambda cfg: _Capture())
+    r = client.post("/share/v1/admin/revoke-all", json={"creator": leaver},
+                    headers=admin)
+    assert r.status_code == 200, r.text
+    assert r.json()["revoked"] == 3
+    audited = {e["detail"]["link_uid"]: e["target_uid"] for e in events
+               if e["action"] == "share_link_revoke"}
+    assert audited == minted
+
+
 def test_revoke_all_is_refused_to_a_non_admin(client, plain, cfg, conn):
     victim = _mint(cfg, conn, created_by=ADMIN)
     r = client.post("/share/v1/admin/revoke-all", json={"creator": ADMIN},
