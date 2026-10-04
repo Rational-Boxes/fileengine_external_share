@@ -248,6 +248,33 @@ class Config:
         self.tenant_base_domain = _first("SHARE_TENANT_BASE_DOMAIN",
                                          "BASE_DOMAIN", "")
 
+        # --- Media links (MEDIA_SHARE.md §11) ------------------------------
+        # kind = 3 exists at all. Off by default, like every new door.
+        self.media_enabled = _bool("SHARE_MEDIA_ENABLED", False)
+        # Whether access_mode = 'open' may be chosen at all (§5 rule 5) — and
+        # even then only by members of a SEPARATE group from the one that gates
+        # minting: publishing to the open internet and sharing with a named
+        # client are different authorities.
+        self.allow_open_mode = _bool("SHARE_ALLOW_OPEN_MODE", False)
+        self.open_ldap_group = _env("SHARE_OPEN_LDAP_GROUP", "share_public")
+        # Largest published rendition a link may be minted over (§6.2 rule 5).
+        self.media_max_bytes = _int("SHARE_MEDIA_MAX_BYTES", 4 * 1024 ** 3)
+        # Default egress budget on a new media link (§6.9).
+        self.media_default_max_bytes = _int("SHARE_MEDIA_DEFAULT_MAX_BYTES", 50 * 1024 ** 3)
+        # convert_search_ai: publishing is asked of it (§4.3), as the creator.
+        self.csai_url = _env("SHARE_CSAI_URL", "http://localhost:8092").rstrip("/")
+        self.csai_timeout_s = _int("SHARE_CSAI_TIMEOUT_S", 15)
+        # The secret on the share_service <-> CSAI internal seam, in BOTH
+        # directions (CSAI asks media-refs; this service asks for a republish).
+        # The same names CSAI reads, so one value configures the pair.
+        self.media_internal_secret = _first("SHARE_MEDIA_INTERNAL_SECRET",
+                                            "CSAI_INTERNAL_SECRET",
+                                            "SERVICE_CRED_INTERNAL_SECRET", "")
+        # The consumer that keeps a link current: republish a new version of a
+        # file with a live link; move pending_media to ready on media.published.
+        self.media_events_enabled = _bool("SHARE_MEDIA_EVENTS_ENABLED", True)
+        self.events_group = _env("SHARE_EVENTS_GROUP", "share_service")
+
         self.log_level = _env("SHARE_LOG_LEVEL", "INFO")
 
 

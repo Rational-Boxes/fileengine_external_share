@@ -33,7 +33,24 @@ _SAFE = re.compile(r"[^a-zA-Z0-9_]")
 KIND_FILE_DOWNLOAD = 0
 KIND_UPLOAD = 1
 KIND_FOLDER_DOWNLOAD = 2
-KINDS = (KIND_FILE_DOWNLOAD, KIND_UPLOAD, KIND_FOLDER_DOWNLOAD)
+# MEDIA_SHARE.md §6.1. resource_uid is the SOURCE file; what plays is its newest
+# published `media` / `audio` rendition, resolved at session open and never
+# stored or accepted from a caller.
+KIND_MEDIA = 3
+KINDS = (KIND_FILE_DOWNLOAD, KIND_UPLOAD, KIND_FOLDER_DOWNLOAD, KIND_MEDIA)
+
+# MEDIA_SHARE.md §5. 'verified' is the default, so every existing row and every
+# non-media link keeps today's behaviour with no migration.
+ACCESS_VERIFIED = "verified"
+ACCESS_CLAIMED = "claimed"
+ACCESS_OPEN = "open"
+ACCESS_MODES = (ACCESS_VERIFIED, ACCESS_CLAIMED, ACCESS_OPEN)
+
+# A media link's readiness. NULL for every other kind.
+MEDIA_PENDING = "pending_media"
+MEDIA_READY = "ready"
+MEDIA_FAILED = "failed"
+MEDIA_STATES = (MEDIA_PENDING, MEDIA_READY, MEDIA_FAILED)
 
 
 # The one table that is NOT per-tenant, and the reason it has to exist.
@@ -158,6 +175,94 @@ def _ddl(schema: str) -> list[str]:
         f"CREATE INDEX IF NOT EXISTS share_links_live     ON {s}.share_links (expires_at) "
         f"    WHERE revoked_at IS NULL;",
 
+        # --- media links (MEDIA_SHARE.md §5, §6.2) --------------------------
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS access_mode TEXT NOT NULL DEFAULT 'verified';",
+        # 0 = no cap on distinct viewers (the egress budget still binds).
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS max_viewers INTEGER NOT NULL DEFAULT 0;",
+        # frame-ancestors for the embed (§9.3); NULL = not embeddable.
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS allowed_embed_origins TEXT[];",
+        # What the landing page and the embed title the video (§9.2).
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS display_name TEXT;",
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS media_state TEXT;",
+        # Stored so /peek and the embed answer without touching the core (§6.2
+        # rule 4). Describe the newest published set this service has heard of.
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS media_version TEXT;",
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS duration_ms BIGINT;",
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS output_bytes BIGINT;",
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS poster_uid UUID;",
+        # The rules are CONSTRAINTS, not route-handler validation (§5 rule 2):
+        # a new endpoint that forgets to call a validator must still be unable
+        # to write an open or claimed link of any other kind. Added only when
+        # absent — ADD CONSTRAINT has no IF NOT EXISTS.
+        _add_constraint(schema, "share_links_access_mode_valid",
+                        "CHECK (access_mode IN ('verified','claimed','open'))"),
+        _add_constraint(schema, "share_links_access_mode_media_only",
+                        "CHECK (access_mode = 'verified' OR kind = 3)"),
+        _add_constraint(schema, "share_links_media_state_valid",
+                        "CHECK (media_state IS NULL OR "
+                        "media_state IN ('pending_media','ready','failed'))"),
+        # §5 rule 1: access_mode is immutable — widening an already-distributed
+        # URL from verified to open must be IMPOSSIBLE, not merely audited. kind
+        # is frozen with it, since flipping kind is the other way to change what
+        # a URL already in someone's inbox does.
+        f"""
+        CREATE OR REPLACE FUNCTION {s}.share_links_freeze_mode() RETURNS trigger
+        LANGUAGE plpgsql AS $fn$
+        BEGIN
+            IF NEW.access_mode IS DISTINCT FROM OLD.access_mode THEN
+                RAISE EXCEPTION 'share_links.access_mode is immutable (link %)', OLD.link_uid
+                    USING ERRCODE = 'check_violation';
+            END IF;
+            IF NEW.kind IS DISTINCT FROM OLD.kind THEN
+                RAISE EXCEPTION 'share_links.kind is immutable (link %)', OLD.link_uid
+                    USING ERRCODE = 'check_violation';
+            END IF;
+            RETURN NEW;
+        END
+        $fn$;
+        """,
+        f"DROP TRIGGER IF EXISTS share_links_freeze_mode ON {s}.share_links;",
+        f"CREATE TRIGGER share_links_freeze_mode BEFORE UPDATE ON {s}.share_links "
+        f"FOR EACH ROW EXECUTE FUNCTION {s}.share_links_freeze_mode();",
+        f"CREATE INDEX IF NOT EXISTS share_links_media_live ON {s}.share_links (resource_uid) "
+        f"    WHERE kind = 3 AND revoked_at IS NULL;",
+
+        # --- share_link_audience (MEDIA_SHARE.md §7.1) ----------------------
+        # NOT share_link_recipients. That table is an ALLOWLIST written by an
+        # authenticated user; this one is an open-ended set written by outsiders,
+        # and putting internet-created rows into the table that defines who is
+        # authorized is a privilege bug two refactors away.
+        f"""
+        CREATE TABLE IF NOT EXISTS {s}.share_link_audience (
+            audience_uid     UUID PRIMARY KEY,
+            link_uid         UUID        NOT NULL REFERENCES {s}.share_links(link_uid) ON DELETE CASCADE,
+            email            TEXT,
+            email_norm       TEXT,
+            verified         BOOLEAN     NOT NULL DEFAULT false,
+            on_allowlist     BOOLEAN     NOT NULL DEFAULT false,
+            first_seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+            last_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            sessions         INTEGER     NOT NULL DEFAULT 0,
+            bytes_served     BIGINT      NOT NULL DEFAULT 0,
+            coverage         BIT VARYING,
+            coverage_pct     SMALLINT    NOT NULL DEFAULT 0,
+            furthest_pct     SMALLINT    NOT NULL DEFAULT 0,
+            plays            INTEGER     NOT NULL DEFAULT 0,
+            completed_at     TIMESTAMPTZ,
+            completion_basis TEXT,
+            source_addr      TEXT,
+            user_agent       TEXT,
+            referer_host     TEXT,
+            consent_text_id  TEXT,
+            UNIQUE (link_uid, email_norm),
+            CHECK (completion_basis IS NULL OR
+                   completion_basis IN ('beacon','beacon+bytes','bytes-floor')),
+            CHECK (coverage_pct BETWEEN 0 AND 100 AND furthest_pct BETWEEN 0 AND 100)
+        );
+        """,
+        f"CREATE INDEX IF NOT EXISTS share_link_audience_link ON {s}.share_link_audience "
+        f"    (link_uid, last_seen_at DESC);",
+
         # --- share_link_members (spec §5.2) ---------------------------------
         # The folder-download snapshot. Deliberately NO crc32 column: filling
         # one would mean reading every member's bytes at creation, and the core
@@ -261,6 +366,23 @@ def _ddl(schema: str) -> list[str]:
         );
         """,
     ]
+
+
+def _add_constraint(schema: str, name: str, definition: str) -> str:
+    """``ALTER TABLE … ADD CONSTRAINT`` once. Postgres has no IF NOT EXISTS for
+    constraints, and re-adding one on every provisioning would fail. Runs under
+    the provisioning advisory lock like everything else here."""
+    return f"""
+        DO $do$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                            WHERE conname = '{name}'
+                              AND conrelid = '"{schema}".share_links'::regclass) THEN
+                ALTER TABLE "{schema}".share_links ADD CONSTRAINT {name} {definition};
+            END IF;
+        END
+        $do$;
+        """
 
 
 # Namespace for the provisioning advisory lock — fixed, so these locks cannot

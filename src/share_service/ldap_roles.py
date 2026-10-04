@@ -164,3 +164,17 @@ def in_share_group(cfg: Config, username: str) -> bool:
     if roles & {r.lower() for r in cfg.admin_roles}:
         return True
     return cfg.ldap_group.lower() in roles
+
+
+def in_open_group(cfg: Config, username: str) -> bool:
+    """May this caller mint an OPEN media link (MEDIA_SHARE.md §5 rule 5)?
+
+    Membership of ``share.open_ldap_group`` and nothing else. Unlike
+    :func:`in_share_group`, administrators are NOT admitted by role: an open
+    link is the one share that reaches people nobody named, and §5 makes it a
+    separate authority precisely so a tenant can grant sharing without granting
+    publication. An administrator who should have it adds themselves to the
+    group, which leaves a record that someone decided so.
+    """
+    roles = {r.lower() for r in resolve_raw_roles(cfg, username)}
+    return cfg.open_ldap_group.lower() in roles

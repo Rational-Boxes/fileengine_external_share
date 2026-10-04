@@ -35,12 +35,14 @@ from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
-from . import core_client, db, links, preflight, snapshot as snapshot_mod
+from . import core_client, db, links, media_client, preflight, snapshot as snapshot_mod
 from .audit import AuditUnavailable, get_emitter
 from .auth import Caller, get_caller
 from .config import Config
-from .ldap_roles import LdapUnavailable, UnknownUser, in_share_group
-from .schema import KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD, KIND_UPLOAD, KINDS
+from .ldap_roles import LdapUnavailable, UnknownUser, in_open_group, in_share_group
+from .schema import (ACCESS_MODES, ACCESS_OPEN, ACCESS_VERIFIED,
+                     KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD, KIND_MEDIA, KIND_UPLOAD,
+                     KINDS, MEDIA_PENDING, MEDIA_READY)
 from .urls import tenant_origin
 
 log = logging.getLogger("share_service.api")
@@ -54,8 +56,10 @@ class CreateLinkRequest(BaseModel):
     """Note there is no `resource_uid`: the target comes from the path, and for
     every later call from the stored row. Nor a `send_invite`: v1 sends no
     invite mail — the creator composes their own (spec §13-R9)."""
-    kind: int = Field(..., description="0 file download, 1 upload, 2 folder download")
-    recipients: List[str] = Field(..., min_length=1)
+    kind: int = Field(..., description="0 file download, 1 upload, 2 folder download, 3 media")
+    # Required for 'verified' links (every kind but media is verified), advisory
+    # for 'claimed', refused for 'open' (MEDIA_SHARE.md §5 rule 3).
+    recipients: List[str] = Field(default_factory=list)
     expires_at: Optional[datetime] = None
     ttl_days: Optional[int] = None
     max_uses: int = 0
@@ -69,6 +73,43 @@ class CreateLinkRequest(BaseModel):
     landing_prefix: Optional[str] = None
     ext_allowlist: Optional[List[str]] = None
     note: Optional[str] = None
+    # --- kind 3 (MEDIA_SHARE.md §5, §6.2) ---
+    access_mode: str = ACCESS_VERIFIED
+    # The creator typed that anyone with the URL, and anyone they forward it
+    # to, can watch. Required for an open link (§5 rule 4).
+    confirm_public: bool = False
+    # Ask for the transcode if the current version is not published yet; false
+    # refuses instead, for a caller that only wants a link to existing bytes.
+    publish: bool = True
+    max_viewers: int = 0
+    allowed_embed_origins: Optional[List[str]] = None
+    display_name: Optional[str] = None
+
+
+#: What the creator of an open link is shown and must acknowledge (§5 rule 4).
+OPEN_LINK_WARNING = ("anyone with this link, and anyone they forward it to, "
+                     "can watch this")
+
+
+def _embed_origins(raw: Optional[List[str]]) -> Optional[List[str]]:
+    """Normalize to bare https origins (scheme://host[:port]). Anything else —
+    a path, a wildcard, http — is refused rather than trimmed: this list becomes
+    frame-ancestors, and a silently widened CSP is the failure to avoid."""
+    from urllib.parse import urlsplit
+    if not raw:
+        return None
+    out: List[str] = []
+    for o in raw:
+        o = (o or "").strip()
+        u = urlsplit(o)
+        if (u.scheme != "https" or not u.hostname or "*" in o or u.username
+                or u.path not in ("", "/") or u.query or u.fragment):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                f"allowed_embed_origins: {o!r} is not an https origin")
+        origin = f"https://{u.hostname.lower()}" + (f":{u.port}" if u.port else "")
+        if origin not in out:
+            out.append(origin)
+    return out
 
 
 class AddRecipientRequest(BaseModel):
@@ -99,7 +140,14 @@ def _link_json(link: links.Link, *, status_override: Optional[str] = None) -> di
         "include_subdirs": link.include_subdirs,
         "archive_bytes": link.archive_bytes,
         "note": link.note,
+        "access_mode": link.access_mode,
         # Never the secret. It existed once, in the creation response.
+        **({"max_viewers": link.max_viewers,
+            "allowed_embed_origins": link.allowed_embed_origins,
+            "display_name": link.display_name, "media_state": link.media_state,
+            "media_version": link.media_version, "duration_ms": link.duration_ms,
+            "output_bytes": link.output_bytes, "poster_uid": link.poster_uid}
+           if link.kind == KIND_MEDIA else {}),
     }
 
 
@@ -183,6 +231,63 @@ def _public_url(cfg: Config, request: Request, tenant: str,
 
 # --- routes ---------------------------------------------------------------
 
+def _bearer(request: Request) -> str:
+    h = request.headers.get("authorization") or ""
+    return h.split(None, 1)[1].strip() if h.lower().startswith("bearer ") else ""
+
+
+def _resolve_media(cfg: Config, request: Request, caller: Caller, resource_uid: str,
+                   publish: bool) -> dict:
+    """The media columns for a new link: ready if the current version is
+    published, else ask CSAI to publish (as the CREATOR — their own bearer, so
+    CSAI's WRITE check is theirs) and mint in ``pending_media``.
+
+    A reader who may share but not edit gets a link only to something already
+    published: lending them this service's authority to spend the tenant's CPU
+    would be the escalation the delegated model exists to prevent."""
+    bearer = _bearer(request)
+    try:
+        st = media_client.state(cfg, bearer=bearer, tenant=caller.tenant,
+                                file_uid=resource_uid)
+        if not st.ready and not st.in_progress:
+            if not publish:
+                raise HTTPException(status.HTTP_409_CONFLICT, {
+                    "error": "not_published",
+                    "message": "this file has no published copy yet (publish=false)"})
+            st = media_client.publish(cfg, bearer=bearer, tenant=caller.tenant,
+                                      file_uid=resource_uid)
+    except media_client.MediaRefused as e:
+        if e.status == 415:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                {"error": "not_media", "message": e.detail})
+        if e.status == 403:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, {
+                "error": "publish_not_permitted",
+                "message": "this video has not been published yet, and publishing it "
+                           "needs edit access to the file — ask someone who can edit "
+                           "it to share it, or to publish it first"})
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, {"error": "media", "message": e.detail})
+    except media_client.MediaUnavailable as e:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            f"media publishing unavailable: {e}")
+
+    if st.ready:
+        primary = st.primary or {}
+        size = primary.get("output_bytes")
+        if size and size > cfg.media_max_bytes:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, {
+                "error": "media_too_large",
+                "message": f"the published copy is {size} bytes; links are limited to "
+                           f"{cfg.media_max_bytes}"})
+        return {"media_state": MEDIA_READY, "media_version": st.source_version,
+                "duration_ms": primary.get("duration_ms"), "output_bytes": size}
+    if not publish:
+        raise HTTPException(status.HTTP_409_CONFLICT, {
+            "error": "not_published",
+            "message": "this file is still being published (publish=false)"})
+    return {"media_state": MEDIA_PENDING}
+
+
 @router.post("/nodes/{resource_uid}/links", status_code=status.HTTP_201_CREATED)
 def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
                 caller: Caller = Depends(get_caller)) -> dict:
@@ -192,6 +297,17 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
 
     if body.kind not in KINDS:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, f"unknown kind {body.kind}")
+    is_media = body.kind == KIND_MEDIA
+    mode = (body.access_mode or ACCESS_VERIFIED).strip().lower()
+    if mode not in ACCESS_MODES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"unknown access_mode {mode!r}")
+    # The database refuses this too (a CHECK constraint); answering here gives
+    # the caller a reason instead of a 500.
+    if not is_media and mode != ACCESS_VERIFIED:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "only media links may be claimed or open")
+    if is_media and not cfg.media_enabled:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "media links are disabled here")
 
     # --- gate 1 (per-user): the share_external LDAP group (spec §8.1) ------
     try:
@@ -204,13 +320,36 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
                             "directory unavailable; cannot confirm permissions")
 
+    # --- an open link needs all three gates (MEDIA_SHARE.md §5) -----------
+    if mode == ACCESS_OPEN:
+        if not cfg.allow_open_mode:
+            raise HTTPException(status.HTTP_403_FORBIDDEN,
+                                "open links are not permitted on this deployment")
+        if not body.confirm_public:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                {"error": "confirm_public_required",
+                                 "message": f"confirm that {OPEN_LINK_WARNING}"})
+        try:
+            if not in_open_group(cfg, caller.user):
+                raise HTTPException(status.HTTP_403_FORBIDDEN,
+                                    f"publishing an open link needs membership of "
+                                    f"{cfg.open_ldap_group!r}")
+        except UnknownUser:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "unknown user")
+        except LdapUnavailable:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                                "directory unavailable; cannot confirm permissions")
+
     # --- recipients + expiry ----------------------------------------------
     emails: list[str] = []
     for raw in body.recipients:
         e = links.normalize_email(raw)
         if e and e not in emails:
             emails.append(e)
-    if not emails:
+    if mode == ACCESS_OPEN and emails:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "an open link has no recipient list")
+    if mode == ACCESS_VERIFIED and not emails:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "at least one recipient is required")
     if len(emails) > cfg.max_recipients:
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
@@ -220,7 +359,16 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
 
-    if cfg.max_uses_cap and (body.max_uses == 0 or body.max_uses > cfg.max_uses_cap):
+    # A media link is metered by viewers and bytes, not by uses (§6.4): a
+    # session per seek would exhaust any use cap in one viewing.
+    if is_media and body.max_uses:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "a media link is limited by max_viewers and max_bytes, not max_uses")
+    if body.max_viewers < 0:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "max_viewers must be 0 or more")
+    embed_origins = _embed_origins(body.allowed_embed_origins) if is_media else None
+    if (not is_media and cfg.max_uses_cap
+            and (body.max_uses == 0 or body.max_uses > cfg.max_uses_cap)):
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
                             f"max_uses must be between 1 and {cfg.max_uses_cap}")
 
@@ -245,6 +393,7 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
     file_bytes = None
     depth = None
     path = ""
+    poster_uid = None
     try:
         with core_client.for_creator(cfg, created_by=caller.user, roles=result.roles or [],
                                      tenant=caller.tenant,
@@ -257,7 +406,9 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
             if not links.kind_matches_resource(body.kind, is_dir):
                 raise HTTPException(status.HTTP_400_BAD_REQUEST,
                                     "kind does not match the resource type "
-                                    "(file for kind 0, folder for kinds 1 and 2)")
+                                    "(file for kinds 0 and 3, folder for kinds 1 and 2)")
+            if is_media:
+                poster_uid = core.poster_uid(resource_uid)
             # A file link records the ENTITY UUID AND THE VERSION TIMESTAMP, so
             # it keeps serving what it was minted for. Unpinned is the explicit
             # opt-in: without this a document shared for review in March
@@ -296,6 +447,11 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"core unavailable: {e}")
 
+    # --- media: resolve the published rendition, or ask for it (§6.2 rule 2)
+    media_fields: dict = {}
+    if is_media:
+        media_fields = _resolve_media(cfg, request, caller, resource_uid, body.publish)
+
     # --- mint --------------------------------------------------------------
     conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
     try:
@@ -303,7 +459,10 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
             conn, kind=body.kind, resource_uid=resource_uid, created_by=caller.user,
             expires_at=expires_at, recipients=emails,
             max_uses=body.max_uses, max_uses_per_recipient=body.max_uses_per_recipient,
-            max_bytes=body.max_bytes, max_file_bytes=body.max_file_bytes,
+            # A media link always carries an egress budget (§6.9): an
+            # unbounded one is how a viral clip becomes the tenant's bill.
+            max_bytes=body.max_bytes or (cfg.media_default_max_bytes if is_media else 0),
+            max_file_bytes=body.max_file_bytes,
             max_files=body.max_files or (cfg.upload_max_files if body.kind == KIND_UPLOAD else 0),
             # Recorded in the cross-tenant directory too, so a recipient — who
             # arrives with no tenant context at all — can be routed to the right
@@ -313,7 +472,12 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
             follow_folder=body.follow_folder, include_subdirs=body.include_subdirs,
             landing_prefix=body.landing_prefix, ext_allowlist=body.ext_allowlist,
             archive_bytes=file_bytes, resource_depth=depth, resource_path=path,
-            note=body.note)
+            note=body.note,
+            **({"access_mode": mode, "max_viewers": body.max_viewers,
+                "allowed_embed_origins": embed_origins,
+                "display_name": (body.display_name or "").strip()[:200] or None,
+                "poster_uid": poster_uid,
+                **media_fields} if is_media else {}))
 
         if snap is not None:
             snapshot_mod.store(conn, link.link_uid, snap)
@@ -328,7 +492,11 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
                 source_addr=caller.source_addr, request_id=link.link_uid,
                 detail={"link_uid": link.link_uid, "kind": link.kind,
                         "recipients": len(emails), "expires_at": expires_at.isoformat(),
-                        "max_uses": link.max_uses})
+                        "max_uses": link.max_uses, "access_mode": link.access_mode,
+                        **({"media_state": link.media_state,
+                            "embed_origins": len(link.allowed_embed_origins or []),
+                            "max_viewers": link.max_viewers}
+                           if link.kind == KIND_MEDIA else {})})
         except AuditUnavailable:
             links.revoke(conn, link.link_uid, revoked_by="system:audit-unavailable")
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -710,6 +878,11 @@ def add_recipient(link_uid: str, body: AddRecipientRequest, request: Request,
                 {"error": "link_not_live", "status": link.status(),
                  "message": f"this link is {link.status()} — it cannot be "
                             "widened; create a new one instead"})
+        # An open link has no recipient list (MEDIA_SHARE.md §5 rule 3); an
+        # address on it would read as a restriction that does not exist.
+        if link.access_mode == ACCESS_OPEN:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                "an open link has no recipient list")
         if links.count_recipients(conn, link_uid) >= cfg.max_recipients:
             raise HTTPException(status.HTTP_400_BAD_REQUEST,
                                 f"at most {cfg.max_recipients} recipients")
