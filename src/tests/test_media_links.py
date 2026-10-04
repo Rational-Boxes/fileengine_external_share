@@ -600,8 +600,10 @@ def test_capabilities_say_what_the_share_tab_may_offer(world, cfg):
     assert world.client.get("/share/v1/capabilities").status_code == 401
 
 
-def test_download_defaults_by_mode(world, conn):
-    assert _create(world).json()["allow_download"] is True                      # verified
+def test_media_links_are_player_only_by_default(world, conn):
+    # The player only, in every mode, unless the creator asks (2026-10-04: a
+    # verified link showed a Download button the owner did not want).
+    assert _create(world).json()["allow_download"] is False                     # verified
     assert _create(world, access_mode="claimed").json()["allow_download"] is False
     assert _create(world, access_mode="claimed", allow_download=True).json()["allow_download"] is True
 
