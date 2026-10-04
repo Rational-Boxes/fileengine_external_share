@@ -393,6 +393,25 @@ def list_for_creator(conn, created_by: str, live_only: bool = True) -> List[Link
         return [_row_to_link(r) for r in cur.fetchall()]
 
 
+# Link.status() as SQL predicates, in the same precedence: revoked beats expired
+# beats blocked beats exhausted. Used to SELECT rows; the badge each row shows is
+# still Link.status(), and test_status_sql_matches_link_status keeps the two in
+# step — the property the Python-only filter was protecting.
+_STATUS_SQL = {
+    "revoked": "l.revoked_at IS NOT NULL",
+    "expired": "l.revoked_at IS NULL AND l.expires_at <= now()",
+    "blocked": ("l.revoked_at IS NULL AND l.expires_at > now() "
+                "AND l.locked_until IS NOT NULL AND l.locked_until > now()"),
+    "exhausted": ("l.revoked_at IS NULL AND l.expires_at > now() "
+                  "AND (l.locked_until IS NULL OR l.locked_until <= now()) "
+                  "AND l.max_uses > 0 AND l.uses_consumed >= l.max_uses"),
+    "active": ("l.revoked_at IS NULL AND l.expires_at > now() "
+               "AND (l.locked_until IS NULL OR l.locked_until <= now()) "
+               "AND NOT (l.max_uses > 0 AND l.uses_consumed >= l.max_uses)"),
+}
+STATUSES = tuple(_STATUS_SQL)
+
+
 def list_for_tenant(conn, *, live_only: bool = True, creator: str = "",
                     recipient: str = "", subtree: str = "", status: str = "",
                     limit: int = 500) -> List[dict]:
@@ -411,6 +430,14 @@ def list_for_tenant(conn, *, live_only: bool = True, creator: str = "",
     params: List[Any] = []
     if live_only:
         where.append("l.revoked_at IS NULL AND l.expires_at > now()")
+    if status:
+        # In the WHERE clause, BEFORE the row cap. Filtering after it (as this
+        # did) looked for revoked links only among the 500 riskiest rows —
+        # mostly active ones — so past the cap they vanished, and when the
+        # filter emptied the page the response even said "not truncated".
+        if status not in _STATUS_SQL:
+            raise ValueError(f"unknown status {status!r}")
+        where.append(f"({_STATUS_SQL[status]})")
     if creator:
         where.append("lower(l.created_by) = lower(%s)")
         params.append(creator)
@@ -469,10 +496,9 @@ def list_for_tenant(conn, *, live_only: bool = True, creator: str = "",
     n = len(_COLUMNS.split(","))
     for r in rows:
         link = _row_to_link(r[:n])
-        # `status` is computed in Python, not SQL, so the console and the
-        # owner-side Share tab cannot drift apart on what "expired" means.
-        if status and link.status() != status:
-            continue
+        # The BADGE is still Link.status(), so the console and the owner-side
+        # Share tab cannot disagree on what "expired" means; the SQL above only
+        # chose the rows, and the parity test holds the two definitions equal.
         out.append({"link": link, "recipient_count": r[n],
                     "last_activity": r[n + 1], "truncated": truncated})
     return out

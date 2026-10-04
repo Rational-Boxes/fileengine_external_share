@@ -605,9 +605,15 @@ def list_my_links(request: Request, live: bool = True, all: bool = False,
             return {"links": [_link_json(l) for l in found]}
 
         _require_admin(cfg, caller)
-        rows = links.list_for_tenant(
-            conn, live_only=live, creator=creator, recipient=recipient,
-            subtree=subtree, status=status_filter)
+        try:
+            rows = links.list_for_tenant(
+                conn, live_only=live, creator=creator, recipient=recipient,
+                subtree=subtree, status=status_filter)
+        except ValueError as e:
+            # An unknown status used to come back as an empty list — which a
+            # console reads as "nothing matches".
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                f"{e}; one of {', '.join(links.STATUSES)}")
     finally:
         conn.close()
 
