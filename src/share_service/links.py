@@ -37,7 +37,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, List, Optional, Tuple
 
 from .config import Config
-from .schema import KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD, KIND_UPLOAD
+from .schema import (ACCESS_VERIFIED, KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD,
+                     KIND_MEDIA, KIND_UPLOAD)
 
 log = logging.getLogger("share_service.links")
 
@@ -109,6 +110,19 @@ class Link:
     # Stale after a move or rename by design (see schema.py).
     resource_depth: Optional[int] = None
     resource_path: Optional[str] = None
+    # Media links (MEDIA_SHARE.md §5, §6.2). access_mode is 'verified' for
+    # every other kind, enforced by a CHECK constraint.
+    access_mode: str = ACCESS_VERIFIED
+    max_viewers: int = 0
+    allowed_embed_origins: Optional[List[str]] = None
+    display_name: Optional[str] = None
+    media_state: Optional[str] = None
+    media_version: Optional[str] = None
+    duration_ms: Optional[int] = None
+    output_bytes: Optional[int] = None
+    poster_uid: Optional[str] = None
+    parked_until: Optional[datetime] = None
+    allow_download: bool = False
 
     @property
     def is_revoked(self) -> bool:
@@ -161,7 +175,10 @@ _COLUMNS = """link_uid, kind, resource_uid, created_by, created_at, expires_at,
               max_uses_per_recipient, max_bytes, bytes_consumed, max_file_bytes,
               max_files, files_consumed, pinned_version, follow_folder,
               include_subdirs, archive_bytes, landing_prefix, ext_allowlist,
-              locked_until, note, resource_depth, resource_path"""
+              locked_until, note, resource_depth, resource_path,
+              access_mode, max_viewers, allowed_embed_origins, display_name,
+              media_state, media_version, duration_ms, output_bytes, poster_uid,
+              parked_until, allow_download"""
 
 
 def _row_to_link(row: tuple) -> Link:
@@ -175,7 +192,12 @@ def _row_to_link(row: tuple) -> Link:
         include_subdirs=row[18], archive_bytes=row[19], landing_prefix=row[20],
         ext_allowlist=list(row[21]) if row[21] else None,
         locked_until=row[22], note=row[23], resource_depth=row[24],
-        resource_path=row[25])
+        resource_path=row[25], access_mode=row[26], max_viewers=row[27],
+        allowed_embed_origins=list(row[28]) if row[28] else None,
+        display_name=row[29], media_state=row[30], media_version=row[31],
+        duration_ms=row[32], output_bytes=row[33],
+        poster_uid=str(row[34]) if row[34] else None, parked_until=row[35],
+        allow_download=bool(row[36]))
 
 
 # --- writes --------------------------------------------------------------
@@ -198,6 +220,10 @@ def create(conn, *, kind: int, resource_uid: str, created_by: str,
         "follow_folder": False, "include_subdirs": True, "landing_prefix": None,
         "ext_allowlist": None, "note": None, "archive_bytes": None,
         "resource_depth": None, "resource_path": None,
+        "access_mode": ACCESS_VERIFIED, "max_viewers": 0,
+        "allowed_embed_origins": None, "display_name": None, "media_state": None,
+        "media_version": None, "duration_ms": None, "output_bytes": None,
+        "poster_uid": None, "allow_download": False,
     }
     # Reject rather than ignore. Filtering silently to the known keys turns a
     # typo — or a newly added budget the INSERT does not carry yet — into a
@@ -215,16 +241,21 @@ def create(conn, *, kind: int, resource_uid: str, created_by: str,
                   max_uses, max_uses_per_recipient, max_bytes, max_file_bytes,
                   max_files, pinned_version, follow_folder, include_subdirs,
                   landing_prefix, ext_allowlist, note, archive_bytes,
-                  resource_depth, resource_path)
+                  resource_depth, resource_path, access_mode, max_viewers,
+                  allowed_embed_origins, display_name, media_state, media_version,
+                  duration_ms, output_bytes, poster_uid, allow_download)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                       %s,%s)""",
+                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (link_uid, kind, resource_uid, hash_secret(secret), created_by, expires_at,
              fields["max_uses"], fields["max_uses_per_recipient"], fields["max_bytes"],
              fields["max_file_bytes"], fields["max_files"], fields["pinned_version"],
              fields["follow_folder"], fields["include_subdirs"],
              fields["landing_prefix"], fields["ext_allowlist"], fields["note"],
              fields["archive_bytes"], fields["resource_depth"],
-             fields["resource_path"]))
+             fields["resource_path"], fields["access_mode"], fields["max_viewers"],
+             fields["allowed_embed_origins"], fields["display_name"],
+             fields["media_state"], fields["media_version"], fields["duration_ms"],
+             fields["output_bytes"], fields["poster_uid"], bool(fields["allow_download"])))
 
         for email in recipients:
             cur.execute(
@@ -278,6 +309,58 @@ def revoke(conn, link_uid: str, revoked_by: str) -> bool:
                 WHERE link_uid = %s AND revoked_at IS NULL""",
             (revoked_by, link_uid))
         changed = cur.rowcount > 0
+    conn.commit()
+    return changed
+
+
+# --- media links (MEDIA_SHARE.md §6.2) ------------------------------------
+
+def live_media_links(conn, resource_uid: str) -> List[Link]:
+    """Media links on this file that can still play — oldest first.
+
+    "Live" is not-dead: revoked, expired and exhausted are one-way, while a
+    lockout lifts by itself and so still counts (see ``Link.is_dead``)."""
+    with conn.cursor() as cur:
+        cur.execute(f"""SELECT {_COLUMNS} FROM share_links
+                         WHERE resource_uid = %s AND kind = %s
+                           AND revoked_at IS NULL AND expires_at > now()
+                         ORDER BY created_at""", (resource_uid, KIND_MEDIA))
+        found = [_row_to_link(r) for r in cur.fetchall()]
+    return [l for l in found if not l.is_dead]
+
+
+def record_media_published(conn, resource_uid: str, *, version: str,
+                           duration_ms: Optional[int], output_bytes: Optional[int]) -> List[str]:
+    """A newer published set exists for this file: every live media link on it
+    is ready and describes that set. Never moves a link BACKWARDS — an older
+    version announced late leaves a newer description alone. Returns the link
+    uids changed."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE share_links
+                  SET media_state = 'ready', media_version = %s,
+                      duration_ms = COALESCE(%s, duration_ms),
+                      output_bytes = COALESCE(%s, output_bytes)
+                WHERE resource_uid = %s AND kind = %s AND revoked_at IS NULL
+                  AND (media_version IS NULL OR media_version <= %s)
+            RETURNING link_uid""",
+            (version, duration_ms, output_bytes, resource_uid, KIND_MEDIA, version))
+        changed = [str(r[0]) for r in cur.fetchall()]
+    conn.commit()
+    return changed
+
+
+def record_media_failed(conn, resource_uid: str, *, version: str) -> List[str]:
+    """The publish of ``version`` failed. Only a link with NOTHING to play yet
+    becomes 'failed'; one already playing an older set keeps playing it — a
+    failed correction must not take a link dark (§6.2 rule 3)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE share_links SET media_state = 'failed'
+                WHERE resource_uid = %s AND kind = %s AND revoked_at IS NULL
+                  AND media_state = 'pending_media'
+            RETURNING link_uid""", (resource_uid, KIND_MEDIA))
+        changed = [str(r[0]) for r in cur.fetchall()]
     conn.commit()
     return changed
 
@@ -699,8 +782,8 @@ def clamp_expiry(cfg: Config, requested: Optional[datetime],
 
 
 def kind_matches_resource(kind: int, is_dir: bool) -> bool:
-    """File for kind 0, directory for kinds 1 and 2 (spec §6.1)."""
-    if kind == KIND_FILE_DOWNLOAD:
+    """File for kinds 0 and 3, directory for kinds 1 and 2 (spec §6.1)."""
+    if kind in (KIND_FILE_DOWNLOAD, KIND_MEDIA):
         return not is_dir
     if kind in (KIND_UPLOAD, KIND_FOLDER_DOWNLOAD):
         return is_dir

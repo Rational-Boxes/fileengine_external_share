@@ -40,6 +40,7 @@ import logging
 from typing import Optional
 
 from . import db
+from . import links as links_mod
 from .audit import AuditUnavailable, get_emitter
 from .config import Config
 
@@ -98,6 +99,14 @@ def sweep_tenant(config: Config, tenant: str, *, limit: int = 500) -> dict:
                 skipped += 1
                 continue
 
+            if row[1] == 3:   # KIND_MEDIA: its audience PII also lives in a sidecar
+                try:
+                    _drop_media_sidecar(config, tenant, conn, link_uid, str(row[2]))
+                except Exception:  # noqa: BLE001 - fail-closed: keep the row, retry
+                    log.exception("retention kept media link %s: sidecar not removed", link_uid)
+                    skipped += 1
+                    continue
+
             with conn.cursor() as cur:
                 # Children first — recipients and redemptions have FK references
                 # and hold the PII this sweep exists for.
@@ -127,6 +136,32 @@ def sweep_tenant(config: Config, tenant: str, *, limit: int = 500) -> dict:
         log.info("retention sweep purged %d link(s) from %s", purged, tenant)
     return {"tenant": tenant, "purged": purged, "skipped": skipped,
             "remaining": len(candidates) == limit}
+
+
+def _drop_media_sidecar(config: Config, tenant: str, conn, link_uid: str,
+                        resource_uid: str) -> None:
+    """The link's audience-<uid>.csv goes BEFORE its rows (§8.4): the PII must not
+    outlive the record that explains it. The rollup is regenerated without the
+    link's rows on the next projection, which the purge forces. Raises if the
+    file cannot be removed, so the caller keeps the row and retries."""
+    from . import audience, ldap_roles
+    from .core_client import for_creator
+    link = links_mod.get(conn, link_uid)
+    roles = ldap_roles.resolve_share_roles(config, link.created_by)
+    name = audience.per_link_name(link_uid)
+    with for_creator(config, created_by=link.created_by, roles=roles, tenant=tenant) as core:
+        for e in core.client.dir(resource_uid) or []:
+            if str(getattr(e, "name", "")) == name:
+                # Scrubbed before the soft delete; the core keeps one version of
+                # a sidecar, so the removed file holds no addresses at all.
+                audience.scrub(core, str(e.uid))
+                core.client.remove(str(e.uid))
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM share_audience_sidecars WHERE resource_uid = %s AND name = %s",
+                    (resource_uid, name))
+    conn.commit()
+    # The rollup held this link's rows too: regenerate it now.
+    audience.mark_dirty(conn, resource_uid, force=True)
 
 
 def sweep(config: Config, tenants: Optional[list] = None) -> list:

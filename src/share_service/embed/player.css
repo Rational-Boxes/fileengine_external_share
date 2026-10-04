@@ -1,0 +1,17 @@
+:root { color-scheme: light dark; --fg: #1d2330; --bg: #fff; --muted: #687083; --primary: #2f6fde; --danger: #c63b3b; }
+@media (prefers-color-scheme: dark) { :root { --fg: #e6e9ef; --bg: #14171d; --muted: #9aa3b2; } }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 15px/1.4 system-ui, sans-serif; }
+.fp { display: flex; flex-direction: column; gap: .6rem; padding: .8rem; box-sizing: border-box; min-height: 100%; }
+.fp h1 { font-size: 1.1rem; margin: 0; }
+.fp video, .fp audio { width: 100%; background: #000; border-radius: 4px; }
+.fp form { display: flex; flex-direction: column; gap: .5rem; }
+.fp label { display: flex; flex-direction: column; gap: .2rem; }
+.fp label.chk { flex-direction: row; gap: .4rem; align-items: flex-start; font-size: .85rem; }
+.fp input[type=email], .fp input[inputmode] { padding: .4rem; font: inherit; }
+.fp button { align-self: flex-start; padding: .4rem .9rem; border: 0; border-radius: 6px; background: var(--primary); color: #fff; font-weight: 600; cursor: pointer; }
+.fp button:disabled { opacity: .5; }
+.fp-small { font-size: .8rem; color: var(--muted); margin: 0; }
+.fp-err { color: var(--danger); margin: 0; }
+.fp-poster { position: relative; }
+.fp-poster img { width: 100%; display: block; border-radius: 4px; }
+.fp-poster button { position: absolute; inset: 0; margin: auto; width: 3.6rem; height: 3.6rem; border-radius: 50%; background: rgba(0,0,0,.6); font-size: 1.4rem; }

@@ -36,7 +36,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from . import api, core_client, db, public, retention
+from . import api, core_client, db, internal, media_door, media_events, public, retention
 from . import metrics as _fe_metrics
 from .audit import get_emitter
 from .config import Config, get_config
@@ -60,7 +60,15 @@ def create_app(config: Config) -> FastAPI:
     # redemption can never be misattributed to a passing authenticated browser
     # (spec §7). Nothing is allowlisted in either direction.
     app.include_router(public.router)
+    # Service-to-service, behind the shared internal secret — its own router
+    # for the same reason the public one is (MEDIA_SHARE.md §6.2).
+    app.include_router(internal.router)
+    # The media door (MEDIA_SHARE.md §6.5): served on its own origin by the
+    # edge, with its own header set — never the public door's attachment/sandbox,
+    # which would stop a <video> playing, and never anything authenticated.
+    app.include_router(media_door.router)
     public.install_hardening(app)
+    media_door.install_hardening(app)
     return app
 
 
@@ -102,7 +110,8 @@ def create_monitoring_app(config: Config) -> FastAPI:
         return {"provisioned_tenants": sorted(db._provisioned)}
 
     # The shared collector, byte-identical across services — installs /metrics.
-    _fe_metrics.install(mon, "share_service", [], {"version": __version__})
+    _fe_metrics.install(mon, "share_service", [media_door.collect_media],
+                        {"version": __version__})
 
     return mon
 
@@ -163,6 +172,8 @@ def main() -> None:
 
     _serve_monitoring(config)
     _serve_retention(config)
+    media_events.start(config)
+    media_events.start_session_sweeper(config)
     log.info("share_service API on %s:%d (monitoring on %s:%d)",
              config.api_host, config.api_port,
              config.monitoring_host, config.monitoring_port)

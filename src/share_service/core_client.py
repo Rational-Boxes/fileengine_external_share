@@ -138,6 +138,24 @@ class DelegatedCore:
         """
         return self.exists(resource_uid) and self.check_permission(resource_uid, permission)
 
+    def poster_uid(self, resource_uid: str) -> Optional[str]:
+        """The still a media link shows before play (MEDIA_SHARE.md §6.2 rule 4):
+        the newest ingest ``poster``, else the newest ``emailposter``. Read as the
+        creator, once, at minting, so /peek never has to touch the core."""
+        best: dict = {}
+        for e in self.client.dir(resource_uid) or []:
+            name = str(getattr(e, "name", "") or "")
+            stem, dot, _ext = name.rpartition(".")
+            version, dash, fmt = stem.rpartition("-")
+            if not dot or not dash or fmt not in ("poster", "emailposter"):
+                continue
+            if fmt not in best or version > best[fmt][0]:
+                best[fmt] = (version, str(e.uid))
+        for fmt in ("poster", "emailposter"):
+            if fmt in best:
+                return best[fmt][1]
+        return None
+
     def current_version(self, resource_uid: str) -> str:
         """The version name a file is at right now — what a link pins to.
 

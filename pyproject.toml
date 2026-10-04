@@ -15,6 +15,7 @@ dependencies = [
     "redis>=5.0",             # audit stream (via audit_service.publisher)
     "pydantic>=2.0",
     "PyJWT>=2.8",             # bearer verification against the shared HS256 secret
+    "httpx>=0.27",            # media_client: CSAI publish/refs calls (MEDIA_SHARE.md)
 ]
 # The FileEngine Python client (`fileengine`, from ../python_interface) is reused at
 # runtime for delegated gRPC core access; install it (`pip install ../python_interface`).
@@ -33,6 +34,11 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The media origin's own static assets: the embed script (vendored from
+# commercial_embedding, kept in step by a test) and the iframe player page.
+[tool.setuptools.package-data]
+share_service = ["embed/*"]
 
 [tool.pytest.ini_options]
 markers = ["live: integration test that needs LDAP + the gRPC core + Postgres + Redis reachable"]

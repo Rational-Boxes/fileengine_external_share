@@ -209,7 +209,11 @@ def test_expiry_is_capped_at_the_deployment_maximum(cfg, client, auth, root_dir)
 def test_recipients_are_required_and_bounded(cfg, client, auth, root_dir):
     r = client.post(f"/share/v1/nodes/{root_dir}/links",
                     json={"kind": 2, "recipients": [], "max_uses": 1}, headers=auth)
-    assert r.status_code == 422  # pydantic min_length
+    # 400 from the route, not 422 from the model: recipients are optional in
+    # the MODEL since media links (a 'claimed' link may carry none, an 'open'
+    # one must carry none), so the verified-needs-recipients rule is the
+    # route's, per access mode (MEDIA_SHARE.md §5 rule 3).
+    assert r.status_code == 400
 
     too_many = [f"user{i}@example.com" for i in range(cfg.max_recipients + 1)]
     r = client.post(f"/share/v1/nodes/{root_dir}/links",
