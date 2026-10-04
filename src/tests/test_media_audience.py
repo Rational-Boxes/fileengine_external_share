@@ -444,3 +444,18 @@ def test_retention_removes_the_sidecar_before_the_rows_and_keeps_the_row_if_it_c
     assert _row(w, "SELECT force FROM share_audience_dirty WHERE resource_uid = %s",
                 w.source)[0] is True
     assert _row(w, "SELECT count(*) FROM share_link_audience WHERE link_uid = %s", link)[0] == 0
+
+
+def test_the_roster_tells_no_playback_data_from_nothing_watched(w):
+    link, _s, s = _session(w)
+    conn = db.connect_for_tenant(w.cfg, TENANT)
+    row = audience.rows(conn, w.source, link)[0]
+    assert row["has_playback"] is False and row["coverage_bits"] == ""
+    conn.close()
+    _beacon(w, link, s["session"], "0" * 10)
+    conn = db.connect_for_tenant(w.cfg, TENANT)
+    row = audience.rows(conn, w.source, link)[0]
+    conn.close()
+    assert row["has_playback"] is True and row["coverage_pct"] == 0
+    assert row["coverage_bits"] == "0" * 10
+    assert "coverage_bits" not in audience.COLUMNS          # UI only, never the CSV

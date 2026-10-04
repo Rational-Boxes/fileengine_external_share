@@ -125,6 +125,11 @@ def rows(conn, resource_uid: str, link_uid: Optional[str] = None) -> List[dict]:
                 "dropoff_seconds": dropoff_seconds(r[12] or "", r[13]),
                 "device_class": r[14] or "", "referer_host": r[15] or "",
                 "link_uid": str(r[16]), "link_note": r[17] or "", "mode": r[18],
+                # For the UI only (not CSV columns): the bitmap a coverage bar
+                # draws, and whether ANY beacon arrived — "no playback data"
+                # must never render as "watched 0%" (§10).
+                "coverage_bits": r[12] or "",
+                "has_playback": r[12] is not None,
             })
     return out
 
