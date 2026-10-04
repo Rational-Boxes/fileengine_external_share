@@ -301,6 +301,17 @@ def test_every_response_is_hardened_errors_included(w):
             assert r.headers["cache-control"] == "no-store"
 
 
+def test_a_trailing_slash_is_the_uniform_404_not_a_redirect(w):
+    # Production answered 500 here: Starlette's slash redirect has no
+    # Content-Type, which the MIME guard refused.
+    for p in ("/media/v1/embed/", "/media/v1/player/", "/media/v1/some-link/"):
+        r = w.client.get(p, follow_redirects=False)
+        assert r.status_code == 404, p
+        assert r.json() == {"error": "not_found"}
+        assert "location" not in r.headers
+        _assert_hardened(r)
+
+
 def test_a_non_media_type_is_never_served(w):
     from fastapi.responses import HTMLResponse
     app = create_app(w.cfg)

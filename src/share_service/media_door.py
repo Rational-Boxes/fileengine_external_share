@@ -169,6 +169,13 @@ def install_hardening(app) -> None:
         response = await call_next(request)
         if not request.url.path.startswith(router.prefix):
             return response
+        # This origin never redirects. The only 3xx it produced was Starlette's
+        # trailing-slash redirect (/embed/ -> /embed, which then matched
+        # /{link_uid}): bodiless, so it carried no Content-Type and the guard
+        # below turned every such probe into a logged 500. It is a path that
+        # names nothing, so it gets the uniform 404 like any other.
+        if 300 <= response.status_code < 400:
+            response = JSONResponse(_NOT_FOUND, status_code=404)
         ctype = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
         path = request.url.path
         # Exactly two exceptions, both our own static files, never content:

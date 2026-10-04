@@ -49,6 +49,11 @@ from .config import Config
 log = logging.getLogger("share_service.media_events")
 
 RETRY_PENDING_SECONDS = 30
+#: MUST exceed the XREADGROUP block below (5000 ms). redis-py 8 defaults
+#: socket_timeout to 5 s, so on an idle stream the socket gave up at the instant
+#: the server was due to answer "no events": a TimeoutError + reconnect on every
+#: quiet poll (seen in production on the first day). Same fix as discussion.
+SOCKET_TIMEOUT_S = 30
 
 
 class MediaEventConsumer:
@@ -73,7 +78,8 @@ class MediaEventConsumer:
             import redis
             self._redis = redis.Redis(host=self.cfg.redis_host, port=self.cfg.redis_port,
                                       password=self.cfg.redis_password or None,
-                                      db=self.cfg.redis_db, decode_responses=True)
+                                      db=self.cfg.redis_db, decode_responses=True,
+                                      socket_timeout=SOCKET_TIMEOUT_S)
         return self._redis
 
     def ensure_group(self) -> None:
@@ -204,10 +210,16 @@ class MediaEventConsumer:
             self._last_pending = now
             n += self._consume(r.xreadgroup(self.cfg.events_group, self.consumer,
                                             {self.cfg.events_stream: "0"}, count=50))
-        n += self._consume(r.xreadgroup(self.cfg.events_group, self.consumer,
-                                        {self.cfg.events_stream: ">"}, count=50,
-                                        block=block_ms))
-        return n
+        import redis
+        try:
+            batch = r.xreadgroup(self.cfg.events_group, self.consumer,
+                                 {self.cfg.events_stream: ">"}, count=50, block=block_ms)
+        except redis.exceptions.TimeoutError:
+            # An idle stream, not a fault: nothing to read. Anything the server
+            # did hand over before the deadline is in our pending list, and the
+            # "0" read above retries it.
+            return n
+        return n + self._consume(batch)
 
     def stop(self) -> None:
         self._stop.set()

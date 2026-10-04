@@ -621,3 +621,36 @@ def test_loopback_embed_origins_only_when_enabled(world, cfg, conn):
     r = _create(world, allowed_embed_origins=["http://localhost:8790"])
     assert r.status_code == 201 and r.json()["allowed_embed_origins"] == ["http://localhost:8790"]
     assert _create(world, allowed_embed_origins=["http://evil.example"]).status_code == 400
+
+
+# ── the consumer's blocking read (production, first day) ─────────────────────
+
+class _IdleRedis:
+    """XREADGROUP as an idle stream looks to redis-py 8 when socket_timeout
+    equals the block: the pending read answers, the blocking one times out."""
+    def __init__(self):
+        self.calls = []
+
+    def xreadgroup(self, group, consumer, streams, count=None, block=None):
+        import redis
+        self.calls.append(block)
+        if block:
+            raise redis.exceptions.TimeoutError("Timeout reading from socket")
+        return []
+
+
+def test_an_idle_stream_timeout_is_no_events_not_a_failure(cfg):
+    r = _IdleRedis()
+    con = media_events.MediaEventConsumer(cfg, redis=r)
+    assert con.run_once(block_ms=5000) == 0      # no exception escapes to run_forever
+    assert r.calls == [None, 5000]               # pending read, then the blocking one
+
+
+def test_the_socket_outlasts_the_block(cfg, monkeypatch):
+    import redis
+    seen = {}
+    monkeypatch.setattr(redis, "Redis", lambda **kw: seen.update(kw) or object())
+    media_events.MediaEventConsumer(cfg)._client()
+    # redis-py 8 defaults socket_timeout to 5 s — the same as the block — which
+    # raised TimeoutError on every quiet poll.
+    assert seen["socket_timeout"] > 5
