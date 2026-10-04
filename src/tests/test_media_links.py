@@ -615,6 +615,7 @@ def test_embed_anywhere_is_for_open_links_only(world, cfg, conn):
 
 
 def test_loopback_embed_origins_only_when_enabled(world, cfg, conn):
+    cfg.media_embed_allow_loopback = False          # pinned: a dev .env may enable it
     assert _create(world, allowed_embed_origins=["http://localhost:8790"]).status_code == 400
     cfg.media_embed_allow_loopback = True
     r = _create(world, allowed_embed_origins=["http://localhost:8790"])

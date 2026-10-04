@@ -194,7 +194,10 @@ def install_hardening(app) -> None:
         static = path.startswith(f"{router.prefix}/embed/") and cc.startswith("public")
         if not static and not (ctype.startswith(("video/", "audio/", "image/")) and cc.startswith("private")):
             response.headers["Cache-Control"] = "no-store"
-        if response.headers.get("access-control-allow-origin") == "*":
+        # Never "*" — except on our own embed script/styles, which every host
+        # must be able to load cross-origin and which carry no credential.
+        if (response.headers.get("access-control-allow-origin") == "*"
+                and not path.startswith(f"{router.prefix}/embed/")):
             del response.headers["access-control-allow-origin"]
         return response
 

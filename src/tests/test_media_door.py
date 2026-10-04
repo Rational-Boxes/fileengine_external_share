@@ -741,6 +741,9 @@ def test_the_embed_script_is_served_as_javascript_and_nothing_else_is(w):
     assert r.status_code == 200 and r.headers["content-type"].startswith("text/javascript")
     assert r.headers["x-content-type-options"] == "nosniff"
     assert r.headers["cache-control"].startswith("public")
+    # Any host must be able to load it cross-origin (it carries no credential);
+    # this is the only place under the door a literal "*" survives.
+    assert r.headers["access-control-allow-origin"] == "*"
     assert "customElements" in r.text or "defineFeMediaShare" in r.text
     for bad in ("../app.py", "nope.js", "%2e%2e%2fapp.py", "player.html"):
         assert w.client.get(f"/media/v1/embed/{bad}").status_code == 404
