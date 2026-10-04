@@ -367,6 +367,14 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
     if body.max_viewers < 0:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "max_viewers must be 0 or more")
     embed_origins = _embed_origins(body.allowed_embed_origins) if is_media else None
+    # The public title (§6.8). Defaulting it to the file name would publish
+    # whatever the internal naming says — "ACME-Q3-teardown-CONFIDENTIAL-v4" —
+    # so an OPEN link must be given one; the others default below.
+    display_name = (body.display_name or "").strip()[:200] or None
+    if is_media and mode == ACCESS_OPEN and not display_name:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            {"error": "display_name_required",
+                             "message": "an open link needs a public title"})
     if (not is_media and cfg.max_uses_cap
             and (body.max_uses == 0 or body.max_uses > cfg.max_uses_cap)):
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
@@ -409,6 +417,8 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
                                     "(file for kinds 0 and 3, folder for kinds 1 and 2)")
             if is_media:
                 poster_uid = core.poster_uid(resource_uid)
+                if not display_name:
+                    display_name = (path.rsplit("/", 1)[-1] or None) if path else None
             # A file link records the ENTITY UUID AND THE VERSION TIMESTAMP, so
             # it keeps serving what it was minted for. Unpinned is the explicit
             # opt-in: without this a document shared for review in March
@@ -475,7 +485,7 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
             note=body.note,
             **({"access_mode": mode, "max_viewers": body.max_viewers,
                 "allowed_embed_origins": embed_origins,
-                "display_name": (body.display_name or "").strip()[:200] or None,
+                "display_name": display_name,
                 "poster_uid": poster_uid,
                 **media_fields} if is_media else {}))
 

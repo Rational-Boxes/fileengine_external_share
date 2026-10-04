@@ -164,7 +164,8 @@ class Config:
         self.attention_events = tuple(
             e.strip() for e in
             _env("SHARE_ATTENTION_EVENTS",
-                 "drop_received,otp_send_failed,link_dead,first_redemption,link_locked").split(",")
+                 "drop_received,otp_send_failed,link_dead,first_redemption,link_locked,"
+                 "media_popular,media_parked").split(",")
             if e.strip())
 
         # --- This service's own Postgres (PRIVATE SHARE_*) -----------------
@@ -274,6 +275,38 @@ class Config:
         # file with a live link; move pending_media to ready on media.published.
         self.media_events_enabled = _bool("SHARE_MEDIA_EVENTS_ENABLED", True)
         self.events_group = _env("SHARE_EVENTS_GROUP", "share_service")
+
+        # --- The media door (§6.3-6.9) -------------------------------------
+        # Where media is served: its own origin, so a <video> can be handed a
+        # real media type without the SPA's origin ever serving one (§6.5).
+        # May carry {tenant}. Set explicitly so a later CDN move keeps embeds.
+        self.media_base_url = _env("SHARE_MEDIA_BASE_URL", "")
+        # A viewing session covers "watching this", pauses and tomorrow's
+        # resume included — not one hour (§6.4).
+        self.media_session_ttl_seconds = _int("SHARE_MEDIA_SESSION_TTL_SECONDS", 86400)
+        # The authority re-check, at most this stale (§6.7). acl.changed /
+        # role.* make it immediate; LDAP group changes emit nothing, so this
+        # interval is their bound.
+        self.media_recheck_seconds = _int("SHARE_MEDIA_RECHECK_SECONDS", 300)
+        self.media_bytes_max_age = _int("SHARE_MEDIA_BYTES_MAX_AGE", 300)
+        # Windows and caps (§6.9).
+        self.media_max_egress_per_hour = _int("SHARE_MEDIA_MAX_EGRESS_PER_HOUR", 5 * 1024 ** 3)
+        self.media_tenant_egress_per_hour = _int("SHARE_MEDIA_TENANT_EGRESS_PER_HOUR",
+                                                 20 * 1024 ** 3)
+        self.media_tenant_egress_per_day = _int("SHARE_MEDIA_TENANT_EGRESS_PER_DAY",
+                                                200 * 1024 ** 3)
+        self.media_max_concurrent_streams = _int("SHARE_MEDIA_MAX_CONCURRENT_STREAMS", 64)
+        self.media_max_concurrent_per_link = _int("SHARE_MEDIA_MAX_CONCURRENT_PER_LINK", 16)
+        self.media_max_concurrent_per_client = _int("SHARE_MEDIA_MAX_CONCURRENT_PER_CLIENT", 3)
+        self.media_soft_ceiling_ratio = float(_env("SHARE_MEDIA_SOFT_CEILING_RATIO", "0.8"))
+        self.media_park_after_minutes = _int("SHARE_MEDIA_PARK_AFTER_MINUTES", 30)
+        self.media_park_minutes = _int("SHARE_MEDIA_PARK_MINUTES", 60)
+        self.media_meter_flush_bytes = _int("SHARE_MEDIA_METER_FLUSH_BYTES", 16 * 1024 ** 2)
+        self.media_meter_flush_seconds = _int("SHARE_MEDIA_METER_FLUSH_SECONDS", 10)
+        self.media_min_throughput_bps = _int("SHARE_MEDIA_MIN_THROUGHPUT_BPS", 8192)
+        self.media_throughput_grace_seconds = _int("SHARE_MEDIA_THROUGHPUT_GRACE_SECONDS", 60)
+        # /claim is a free write endpoint for anyone holding the URL (§7.3).
+        self.claim_rate_per_hour = _int("SHARE_CLAIM_RATE_PER_HOUR", 10)
 
         self.log_level = _env("SHARE_LOG_LEVEL", "INFO")
 

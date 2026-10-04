@@ -227,6 +227,10 @@ def _ddl(schema: str) -> list[str]:
         f"CREATE INDEX IF NOT EXISTS share_links_media_live ON {s}.share_links (resource_uid) "
         f"    WHERE kind = 3 AND revoked_at IS NULL;",
 
+        # Rung 3 of the media ladder (§6.9): until when a link is parked. NOT a
+        # revocation — anyone holding the URL could otherwise destroy the link.
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS parked_until TIMESTAMPTZ;",
+
         # --- share_link_audience (MEDIA_SHARE.md §7.1) ----------------------
         # NOT share_link_recipients. That table is an ALLOWLIST written by an
         # authenticated user; this one is an open-ended set written by outsiders,
@@ -262,6 +266,38 @@ def _ddl(schema: str) -> list[str]:
         """,
         f"CREATE INDEX IF NOT EXISTS share_link_audience_link ON {s}.share_link_audience "
         f"    (link_uid, last_seen_at DESC);",
+
+        # --- share_media_sessions (MEDIA_SHARE.md §6.3-6.4) -----------------
+        # NOT share_redemptions. That table's verified_email is NOT NULL — the
+        # schema-level statement that no session opens unverified — and a
+        # claimed or open viewer is exactly that. Keeping the invariant intact
+        # beats weakening it for a new kind.
+        #
+        # The session token is the viewer's credential for every ranged GET
+        # (a <video> element cannot send a header), so only its hash is kept.
+        f"""
+        CREATE TABLE IF NOT EXISTS {s}.share_media_sessions (
+            session_uid    UUID PRIMARY KEY,
+            link_uid       UUID        NOT NULL REFERENCES {s}.share_links(link_uid) ON DELETE CASCADE,
+            audience_uid   UUID        REFERENCES {s}.share_link_audience(audience_uid) ON DELETE SET NULL,
+            mode           TEXT        NOT NULL CHECK (mode IN ('verified','claimed','open')),
+            token_hash     BYTEA       NOT NULL UNIQUE,
+            opened_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+            expires_at     TIMESTAMPTZ NOT NULL,
+            last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+            checked_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            bytes_served   BIGINT      NOT NULL DEFAULT 0,
+            ended_at       TIMESTAMPTZ,
+            end_reason     TEXT,
+            source_addr    TEXT,
+            user_agent     TEXT,
+            referer_host   TEXT
+        );
+        """,
+        f"CREATE INDEX IF NOT EXISTS share_media_sessions_link ON {s}.share_media_sessions "
+        f"    (link_uid, opened_at DESC);",
+        f"CREATE INDEX IF NOT EXISTS share_media_sessions_open ON {s}.share_media_sessions "
+        f"    (expires_at) WHERE ended_at IS NULL;",
 
         # --- share_link_members (spec §5.2) ---------------------------------
         # The folder-download snapshot. Deliberately NO crc32 column: filling

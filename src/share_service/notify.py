@@ -49,6 +49,10 @@ LINK_DEAD = "link_dead"
 OTP_SEND_FAILED = "otp_send_failed"
 FIRST_REDEMPTION = "first_redemption"
 LINK_LOCKED = "link_locked"
+# The media ladder (MEDIA_SHARE.md §6.9): rung 1 advises, rung 3 parks. Both
+# carry the numbers and the "publish it elsewhere" recommendation.
+MEDIA_POPULAR = "media_popular"
+MEDIA_PARKED = "media_parked"
 
 
 class EventPublisher:

@@ -121,6 +121,7 @@ class Link:
     duration_ms: Optional[int] = None
     output_bytes: Optional[int] = None
     poster_uid: Optional[str] = None
+    parked_until: Optional[datetime] = None
 
     @property
     def is_revoked(self) -> bool:
@@ -175,7 +176,8 @@ _COLUMNS = """link_uid, kind, resource_uid, created_by, created_at, expires_at,
               include_subdirs, archive_bytes, landing_prefix, ext_allowlist,
               locked_until, note, resource_depth, resource_path,
               access_mode, max_viewers, allowed_embed_origins, display_name,
-              media_state, media_version, duration_ms, output_bytes, poster_uid"""
+              media_state, media_version, duration_ms, output_bytes, poster_uid,
+              parked_until"""
 
 
 def _row_to_link(row: tuple) -> Link:
@@ -193,7 +195,7 @@ def _row_to_link(row: tuple) -> Link:
         allowed_embed_origins=list(row[28]) if row[28] else None,
         display_name=row[29], media_state=row[30], media_version=row[31],
         duration_ms=row[32], output_bytes=row[33],
-        poster_uid=str(row[34]) if row[34] else None)
+        poster_uid=str(row[34]) if row[34] else None, parked_until=row[35])
 
 
 # --- writes --------------------------------------------------------------

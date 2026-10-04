@@ -237,7 +237,7 @@ def test_claimed_takes_an_optional_advisory_list(world, conn):
 
 
 def test_open_needs_all_three_gates(world, cfg, conn):
-    ok = dict(access_mode="open", recipients=[], confirm_public=True)
+    ok = dict(access_mode="open", recipients=[], confirm_public=True, display_name="Walkthrough")
     assert _create(world, **ok).status_code == 201
     r = _create(world, **{**ok, "confirm_public": False})
     assert r.status_code == 400 and "anyone with this link" in r.json()["detail"]["message"]
@@ -246,6 +246,12 @@ def test_open_needs_all_three_gates(world, cfg, conn):
     world.open_group = True
     cfg.allow_open_mode = False
     assert _create(world, **ok).status_code == 403
+
+
+def test_an_open_link_needs_a_public_title_and_others_default_to_the_file_name(world, conn):
+    r = _create(world, access_mode="open", recipients=[], confirm_public=True)
+    assert r.status_code == 400 and r.json()["detail"]["error"] == "display_name_required"
+    assert _create(world).json()["display_name"] == "intro.mp4"     # from the path
 
 
 def test_open_refuses_a_recipient_list(world):
@@ -284,8 +290,8 @@ def test_embed_origins_must_be_bare_https_origins(world, origin):
 
 
 def test_an_open_link_cannot_gain_a_recipient_list_later(world, conn):
-    link_uid = _create(world, access_mode="open", recipients=[],
-                       confirm_public=True).json()["link_uid"]
+    link_uid = _create(world, access_mode="open", recipients=[], confirm_public=True,
+                       display_name="Walkthrough").json()["link_uid"]
     r = world.client.post(f"/share/v1/links/{link_uid}/recipients",
                           json={"email": "x@example.com"}, headers=world.auth)
     assert r.status_code == 400

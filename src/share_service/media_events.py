@@ -100,7 +100,17 @@ class MediaEventConsumer:
         etype = event.get("type") or ""
         tenant = event.get("tenant") or ""
         file_uid = event.get("file_uid") or ""
-        if not tenant or not file_uid:
+        if not tenant:
+            return True
+        if not file_uid and not (etype == "acl.changed" or etype.startswith("role.")):
+            return True
+        if etype == "acl.changed" or etype.startswith("role."):
+            # The media door re-checks a creator's authority at most every
+            # media_recheck_seconds; this makes a revocation the NEXT request's
+            # problem instead (§6.7). Tenant-wide and shared via Redis, since the
+            # consumer group hands this event to ONE replica.
+            from .media_meter import get_meter
+            get_meter(self.cfg).bump_acl_epoch(tenant)
             return True
         if etype == "file.updated":
             if event.get("is_rendition") or event.get("is_folder"):
@@ -121,6 +131,8 @@ class MediaEventConsumer:
                     changed = links.record_media_failed(conn, file_uid, version=version)
             finally:
                 conn.close()
+            from .media_door import forget_published
+            forget_published(tenant, file_uid)
             if changed:
                 log.info("%s %s@%s -> %d link(s)", etype, file_uid, version, len(changed))
             return True
@@ -209,6 +221,25 @@ class MediaEventConsumer:
             except Exception:  # noqa: BLE001
                 log.exception("media event consumer pass failed; retrying")
                 self._stop.wait(5)
+
+
+def start_session_sweeper(cfg: Config, interval: int = 60) -> Optional[threading.Thread]:
+    """Close expired viewing sessions, each with its share_media_session_end."""
+    if not cfg.media_enabled:
+        return None
+
+    def loop():
+        from .media_door import end_expired_sessions, media_tenants
+        while True:
+            time.sleep(interval)
+            try:
+                end_expired_sessions(cfg, media_tenants(cfg))
+            except Exception:  # noqa: BLE001
+                log.exception("media session sweep failed")
+
+    t = threading.Thread(target=loop, name="share-media-sessions", daemon=True)
+    t.start()
+    return t
 
 
 def start(cfg: Config) -> Optional[threading.Thread]:
