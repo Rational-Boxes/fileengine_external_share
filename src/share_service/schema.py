@@ -299,6 +299,54 @@ def _ddl(schema: str) -> list[str]:
         f"CREATE INDEX IF NOT EXISTS share_media_sessions_open ON {s}.share_media_sessions "
         f"    (expires_at) WHERE ended_at IS NULL;",
 
+        # --- share_media_playback (MEDIA_SHARE.md §7.4) ---------------------
+        # One row per viewing session: the cumulative state its beacons carried,
+        # merged by UNION (coverage |) and maximum, so a lost beacon costs
+        # nothing and a duplicated one is a no-op. Keyed on the media session —
+        # the spec's sketch named share_redemptions, which media sessions are
+        # deliberately not (see share_media_sessions).
+        f"""
+        CREATE TABLE IF NOT EXISTS {s}.share_media_playback (
+            session_uid    UUID PRIMARY KEY REFERENCES {s}.share_media_sessions(session_uid) ON DELETE CASCADE,
+            link_uid       UUID        NOT NULL,
+            audience_uid   UUID,
+            started_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            last_beacon_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            buckets        SMALLINT    NOT NULL CHECK (buckets BETWEEN 1 AND 1000),
+            coverage       BIT VARYING NOT NULL,
+            furthest_ms    BIGINT      NOT NULL DEFAULT 0,
+            watch_ms       BIGINT      NOT NULL DEFAULT 0,
+            plays          INTEGER     NOT NULL DEFAULT 0,
+            rate_max       REAL        NOT NULL DEFAULT 1.0,
+            ended          BOOLEAN     NOT NULL DEFAULT false,
+            quality        TEXT,
+            device_class   TEXT CHECK (device_class IN ('desktop','mobile','tablet'))
+        );
+        """,
+        f"CREATE INDEX IF NOT EXISTS share_media_playback_audience ON {s}.share_media_playback (audience_uid);",
+
+        # --- the audience sidecar's state (MEDIA_SHARE.md §8.2) -------------
+        # Which files have audience changes not yet projected, and the hash of
+        # what each sidecar last held — so a debounced projection writes only
+        # when something changed, and an idle link accrues no identical versions.
+        f"""
+        CREATE TABLE IF NOT EXISTS {s}.share_audience_sidecars (
+            resource_uid  UUID        NOT NULL,
+            name          TEXT        NOT NULL,
+            content_sha   BYTEA,
+            written_at    TIMESTAMPTZ,
+            last_error    TEXT,
+            PRIMARY KEY (resource_uid, name)
+        );
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {s}.share_audience_dirty (
+            resource_uid  UUID PRIMARY KEY,
+            dirty_since   TIMESTAMPTZ NOT NULL DEFAULT now(),
+            force         BOOLEAN     NOT NULL DEFAULT false
+        );
+        """,
+
         # --- share_link_members (spec §5.2) ---------------------------------
         # The folder-download snapshot. Deliberately NO crc32 column: filling
         # one would mean reading every member's bytes at creation, and the core

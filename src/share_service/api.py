@@ -35,7 +35,7 @@ from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
-from . import core_client, db, links, media_client, preflight, snapshot as snapshot_mod
+from . import audience, core_client, db, links, media_client, preflight, snapshot as snapshot_mod
 from .audit import AuditUnavailable, get_emitter
 from .auth import Caller, get_caller
 from .config import Config
@@ -807,9 +807,18 @@ def revoke_link(link_uid: str, request: Request,
         # plaintext secret does not exist server-side), and cannot read content.
         link = _owned_link(conn, link_uid, caller, cfg)
         changed = links.revoke(conn, link_uid, caller.user)
+        if changed and link.kind == KIND_MEDIA:
+            # The sidecar is projected immediately on revoke (§8.2), not at the
+            # next debounce: the last word on who watched should not wait.
+            audience.mark_dirty(conn, link.resource_uid, force=True)
     finally:
         conn.close()
     on_behalf = link.created_by != caller.user
+    if changed and link.kind == KIND_MEDIA and cfg.audience_csv_enabled:
+        try:
+            audience.project(cfg, caller.tenant, link.resource_uid)
+        except Exception:  # noqa: BLE001 - the sweep retries; a revoke never fails on it
+            log.exception("audience projection after revoke failed for %s", link_uid)
 
     if changed:
         try:
@@ -949,3 +958,101 @@ def remove_recipient(link_uid: str, email: str, request: Request,
                                 "recipient removed, but the audit record could not "
                                 "be written — report this")
     return {"link_uid": link_uid, "email": normalized, "removed": True, "changed": changed}
+
+
+# --- the audience (MEDIA_SHARE.md §7.2, §8) ---------------------------------
+
+def _media_link_owned(conn, link_uid: str, caller: Caller) -> links.Link:
+    """The creator's own media link. NOT widened to tenant admins: the roster is
+    personal data about people the creator chose to send to."""
+    link = _owned_link(conn, link_uid, caller)
+    if link.kind != KIND_MEDIA:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "not_found")
+    return link
+
+
+@router.get("/links/{link_uid}/audience")
+def link_audience(link_uid: str, request: Request,
+                  caller: Caller = Depends(get_caller)) -> dict:
+    """Who watched this link, and how much (§7.2). `verified` is the column a
+    reader must branch on: a claimed address was typed, never checked."""
+    cfg = _config(request)
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        link = _media_link_owned(conn, link_uid, caller)
+        roster = audience.rows(conn, link.resource_uid, link_uid)
+        from .playback import retention_curve
+        curve = retention_curve(conn, link_uid) if cfg.playback_tracking else []
+    finally:
+        conn.close()
+    totals = {"viewers": len(roster),
+              "completed": sum(1 for r in roster if r["completed"]),
+              "bytes_served": sum(int(r["bytes_served"] or 0) for r in roster),
+              "referers": sorted({r["referer_host"] for r in roster if r["referer_host"]}),
+              "retention": curve}
+    return {"link_uid": link_uid, "mode": link.access_mode,
+            "tracking": bool(cfg.playback_tracking),
+            "unverified_note": ("These people typed an address to watch. We did not check "
+                                "it, so any of them may be inaccurate or invented.")
+            if link.access_mode == "claimed" else None,
+            # An open link has no addresses: the aggregate is the roster.
+            "audience": [] if link.access_mode == "open" else roster,
+            "totals": totals}
+
+
+@router.get("/links/{link_uid}/audience.csv")
+def link_audience_csv(link_uid: str, request: Request,
+                      caller: Caller = Depends(get_caller)):
+    """The same data as the sidecar, as a download (§7.2)."""
+    from fastapi.responses import Response
+    cfg = _config(request)
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        link = _media_link_owned(conn, link_uid, caller)
+        body = audience.render(audience.rows(conn, link.resource_uid, link_uid))
+    finally:
+        conn.close()
+    get_emitter(cfg).emit(action="share_audience_exported", outcome="ok", category="access",
+                          actor=caller.user, tenant=caller.tenant, target_uid=link.resource_uid,
+                          source_addr=caller.source_addr, request_id=link_uid,
+                          detail={"link_uid": link_uid, "via": "export"})
+    return Response(body, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="{audience.per_link_name(link_uid)}"',
+                             "Cache-Control": "no-store"})
+
+
+@router.post("/links/{link_uid}/audience/flush")
+def flush_audience(link_uid: str, request: Request,
+                   caller: Caller = Depends(get_caller)) -> dict:
+    """Regenerate the sidecar now rather than at the next debounce (§8.2)."""
+    cfg = _config(request)
+    conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
+    try:
+        link = _media_link_owned(conn, link_uid, caller)
+        audience.mark_dirty(conn, link.resource_uid, force=True)
+    finally:
+        conn.close()
+    return audience.project(cfg, caller.tenant, link.resource_uid)
+
+
+class EraseAddressRequest(BaseModel):
+    email: str
+
+
+@router.post("/admin/audience/erase")
+def erase_audience_address(body: EraseAddressRequest, request: Request,
+                           caller: Caller = Depends(get_caller)) -> dict:
+    """An erasure request naming an address (§8.4) — a tenant administrator's
+    action. Clears the address's audience and playback rows in this tenant and
+    regenerates every sidecar that held it."""
+    cfg = _config(request)
+    _require_admin(cfg, caller)
+    email = links.normalize_email(body.email)
+    if not email:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "email required")
+    get_emitter(cfg).emit_or_raise(
+        action="share_audience_erased", outcome="ok", category="admin", actor=caller.user,
+        tenant=caller.tenant, source_addr=caller.source_addr, request_id=email,
+        detail={"email": email})
+    return audience.erase_address(cfg, caller.tenant, email)

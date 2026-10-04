@@ -53,6 +53,8 @@ LINK_LOCKED = "link_locked"
 # carry the numbers and the "publish it elsewhere" recommendation.
 MEDIA_POPULAR = "media_popular"
 MEDIA_PARKED = "media_parked"
+# "Priya finished your introduction video" (§7.4) — gated links only.
+MEDIA_COMPLETED = "media_completed"
 
 
 class EventPublisher:

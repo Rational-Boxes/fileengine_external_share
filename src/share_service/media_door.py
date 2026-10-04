@@ -69,7 +69,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import db, links, notify, otp_client, preflight, public
+from . import audience, db, links, notify, otp_client, playback, preflight, public
 from .audit import AuditUnavailable, get_emitter
 from .auth import client_addr
 from .config import Config
@@ -386,6 +386,8 @@ def peek(link_uid: str, request: Request, k: Optional[str] = None,
         "poster": f"{router.prefix}/{link_uid}/poster" if link.poster_uid else None,
         "state": state, "progress_pct": None, "requires": requires,
         "allow_download": False, "sources": sources,
+        # The player sends no beacon when this is false, and the page says so.
+        "tracking": bool(cfg.playback_tracking),
     }
     return _json(payload, headers=cors)
 
@@ -556,8 +558,12 @@ def _open(cfg: Config, request: Request, tenant: str, conn, link, *, mode: str,
     _count("sessions", tenant, mode)
     _v, fmts = _published_set(cfg, tenant, link, roles)
     sources = [{**s, "url": s["url"] + f"&t={token}"} for s in _sources(link.link_uid, fmts)]
+    audience.mark_dirty(conn, link.resource_uid)
     return _json({"session": token, "expires_at": expires, "title": link.display_name,
-                  "duration_ms": link.duration_ms, "sources": sources},
+                  "duration_ms": link.duration_ms, "sources": sources,
+                  "tracking": bool(cfg.playback_tracking),
+                  **({"beacon": f"{router.prefix}/{link.link_uid}/playback?t={token}"}
+                     if cfg.playback_tracking else {})},
                  headers=cors)
 
 
@@ -740,7 +746,7 @@ def content(link_uid: str, request: Request, q: str = "hd", t: Optional[str] = N
         headers["Content-Range"] = crange
     _count("requests", tenant, "ok")
     gen = _stream(cfg, tenant, link, roles, entry["uid"], start, length, session_uid,
-                  audience_uid, decision.ticket)
+                  audience_uid, decision.ticket, total=total)
     return StreamingResponse(gen, status_code=code, media_type=mime, headers=headers)
 
 
@@ -799,7 +805,8 @@ class _Flusher:
 
 
 def _stream(cfg: Config, tenant: str, link, roles: List[str], rendition_uid: str,
-            start: int, length: int, session_uid: str, audience_uid: Optional[str], ticket):
+            start: int, length: int, session_uid: str, audience_uid: Optional[str], ticket,
+            total: int = 0):
     meter = get_meter(cfg)
     flusher = _Flusher(cfg, tenant, link.link_uid, session_uid, audience_uid)
     began = time.monotonic()
@@ -831,6 +838,71 @@ def _stream(cfg: Config, tenant: str, link, roles: List[str], rendition_uid: str
         flusher.flush()
         meter.release(ticket)
         _count("active", tenant, n=-1)
+        if sent:
+            _after_bytes(cfg, tenant, link, session_uid, audience_uid, total)
+
+
+def _after_bytes(cfg: Config, tenant: str, link, session_uid: str,
+                 audience_uid: Optional[str], total: int) -> None:
+    """The audience changed (bytes served): the sidecar is due."""
+    try:
+        conn = db.connect_for_tenant(cfg, tenant)
+        try:
+            audience.mark_dirty(conn, link.resource_uid)
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 - never fail a response over a rollup
+        log.exception("post-stream audience update failed for %s", link.link_uid)
+
+
+def _session_over(cfg: Config, conn, tenant: str, link_uid: str, session_uid: str) -> None:
+    """When a session ENDS with no beacon ever having arrived — blocked, or an old
+    player — enough bytes delivered make 'probably watched' (bytes-floor).
+
+    Only at the end: a browser fetches a short clip whole as soon as it loads,
+    before anyone presses play, so judging at the end of a stream would call
+    every loaded-but-unwatched clip watched."""
+    if not cfg.playback_tracking:
+        return
+    try:
+        link = links.get(conn, link_uid)
+        with conn.cursor() as cur:
+            cur.execute("SELECT audience_uid FROM share_media_sessions WHERE session_uid = %s",
+                        (session_uid,))
+            row = cur.fetchone()
+        audience_uid = str(row[0]) if row and row[0] else None
+        if playback.bytes_floor(conn, cfg, session_uid=session_uid, audience_uid=audience_uid,
+                                rendition_size=int(link.output_bytes or 0)):
+            _completed(cfg, conn, tenant, link, session_uid, "bytes-floor")
+        audience.mark_dirty(conn, link.resource_uid)
+    except Exception:  # noqa: BLE001
+        log.exception("end-of-session evaluation failed for %s", session_uid)
+
+
+def _completed(cfg: Config, conn, tenant: str, link, session_uid: str, basis: str) -> None:
+    """share_media_completed, and — for a GATED link — the attention item the
+    feature is judged on ("Priya finished your video"). Off for open links,
+    where it would be noise."""
+    with conn.cursor() as cur:
+        cur.execute("""SELECT s.mode, a.email_norm FROM share_media_sessions s
+                         LEFT JOIN share_link_audience a ON a.audience_uid = s.audience_uid
+                        WHERE s.session_uid = %s""", (session_uid,))
+        mode, email = cur.fetchone() or ("open", None)
+    actor = {"verified": f"share:{link.link_uid}|{email}",
+             "claimed": f"share:{link.link_uid}|claimed:{email}"}.get(
+        mode, f"share:{link.link_uid}|anon:{session_uid}")
+    get_emitter(cfg).emit(action="share_media_completed", outcome="ok", category="access",
+                          actor=actor, tenant=tenant, target_uid=link.resource_uid,
+                          request_id=session_uid,
+                          detail={"link_uid": link.link_uid, "session_uid": session_uid,
+                                  "completion_basis": basis, "mode": mode})
+    if mode != ACCESS_OPEN and email:
+        what = "probably finished" if basis == "bytes-floor" else "finished"
+        get_publisher(cfg).publish(
+            notify.MEDIA_COMPLETED, tenant=tenant, creator=link.created_by,
+            link_uid=link.link_uid, file_uid=link.resource_uid, actor=actor,
+            detail=f"{email} {what} \u201c{link.display_name or 'your video'}\u201d"
+                   + (" (unverified address)" if mode == ACCESS_CLAIMED else ""))
 
 
 def _end_session(conn, cfg: Config, tenant: str, link, session_uid: str, reason: str) -> None:
@@ -843,6 +915,7 @@ def _end_session(conn, cfg: Config, tenant: str, link, session_uid: str, reason:
     if row:
         _audit_end(cfg, tenant, link.link_uid, link.resource_uid, session_uid, reason,
                    int(row[0] or 0), row[1], row[2])
+        _session_over(cfg, conn, tenant, link.link_uid, session_uid)
 
 
 def _audit_end(cfg, tenant, link_uid, resource_uid, session_uid, reason, nbytes, opened_at, mode):
@@ -896,11 +969,80 @@ def end_expired_sessions(cfg: Config, tenants) -> int:
             rows = []
         finally:
             conn.close()
-        for r in rows:
-            _audit_end(cfg, tenant, str(r[1]), str(r[2]), str(r[0]), "expired",
-                       int(r[3] or 0), r[4], r[5])
-            n += 1
+        if rows:
+            conn = db.connect_for_tenant(cfg, tenant)
+            try:
+                for r in rows:
+                    _audit_end(cfg, tenant, str(r[1]), str(r[2]), str(r[0]), "expired",
+                               int(r[3] or 0), r[4], r[5])
+                    _session_over(cfg, conn, tenant, str(r[1]), str(r[0]))
+                    n += 1
+            finally:
+                conn.close()
     return n
+
+
+# ── the playback beacon (§7.4) ─────────────────────────────────────────────────
+
+@router.post("/{link_uid}/playback")
+async def beacon(link_uid: str, request: Request, t: Optional[str] = None) -> Response:
+    """The session's CUMULATIVE playback state. ``t`` authorizes it, and it is
+    merged into that session alone. sendBeacon posts text/plain, which is fine."""
+    cfg = _cfg(request)
+    if not cfg.playback_tracking:
+        raise _deny()                       # no route, not an empty one
+    raw = await request.body()
+    if len(raw) > playback.MAX_BEACON_BYTES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, {"error": "too_large"})
+    body = await _body(request)
+    return await run_in_threadpool(_beacon, link_uid, request, t, body)
+
+
+def _beacon(link_uid: str, request: Request, t: Optional[str], body: dict) -> Response:
+    cfg = _cfg(request)
+    if not cfg.enabled or not cfg.media_enabled or not t:
+        raise _deny()
+    tenant = _tenant_for(cfg, link_uid)
+    conn = db.connect_for_tenant(cfg, tenant, provision=True)
+    try:
+        try:
+            link = links.get(conn, link_uid)
+        except links.LinkNotFound:
+            raise _deny()
+        with conn.cursor() as cur:
+            cur.execute("""SELECT session_uid, audience_uid FROM share_media_sessions
+                            WHERE token_hash = %s AND link_uid = %s
+                              AND ended_at IS NULL AND expires_at > now()""",
+                        (hashlib.sha256(t.encode()).digest(), link_uid))
+            row = cur.fetchone()
+        if not row or link.kind != KIND_MEDIA or link.status() != "active":
+            raise _deny()
+        session_uid, audience_uid = str(row[0]), (str(row[1]) if row[1] else None)
+        # Another session's state is refused, never merged (§13.15).
+        if body.get("session") is not None and body.get("session") != t:
+            return _json({"error": "session_mismatch"}, status_code=403)
+        try:
+            b = playback.parse(body, cfg)
+        except playback.BadBeacon as e:
+            return _json({"error": "bad_beacon", "message": str(e)}, status_code=400)
+        size = None
+        roles = _authorize(cfg, tenant, link)
+        if roles is None:
+            raise _deny()
+        if b.quality:
+            _v, fmts = _published_set(cfg, tenant, link, roles)
+            entry = fmts.get(QUALITIES[b.quality])
+            size = int(entry["size"]) if entry else None
+        basis = playback.record(conn, cfg, session_uid=session_uid, link=link,
+                                audience_uid=audience_uid, beacon=b,
+                                user_agent=request.headers.get("user-agent", ""),
+                                rendition_size=size)
+        if basis:
+            _completed(cfg, conn, tenant, link, session_uid, basis)
+        audience.mark_dirty(conn, link.resource_uid)
+        return _json({"ok": True}, headers=_cors(cfg, request, tenant, link))
+    finally:
+        conn.close()
 
 
 # ── the poster ─────────────────────────────────────────────────────────────────

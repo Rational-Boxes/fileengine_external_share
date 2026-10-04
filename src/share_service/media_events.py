@@ -233,9 +233,12 @@ def start_session_sweeper(cfg: Config, interval: int = 60) -> Optional[threading
         while True:
             time.sleep(interval)
             try:
-                end_expired_sessions(cfg, media_tenants(cfg))
+                tenants = media_tenants(cfg)
+                end_expired_sessions(cfg, tenants)
+                from .audience import run_due
+                run_due(cfg, tenants)
             except Exception:  # noqa: BLE001
-                log.exception("media session sweep failed")
+                log.exception("media session / audience sweep failed")
 
     t = threading.Thread(target=loop, name="share-media-sessions", daemon=True)
     t.start()

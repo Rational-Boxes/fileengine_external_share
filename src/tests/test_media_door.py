@@ -218,7 +218,11 @@ def w(cfg, monkeypatch):
     world.meter = meter
     world.cfg = cfg
     world.client = TestClient(create_app(cfg), raise_server_exceptions=False)
-    return world
+    yield world
+    # The source is a fake; leave nothing in the shared dev database that a
+    # running service's sweeper would try (and fail) to project.
+    _row(world, "DELETE FROM share_audience_dirty WHERE resource_uid = %s RETURNING 1",
+         world.source)
 
 
 def _mint(w, mode="claimed", **kw):

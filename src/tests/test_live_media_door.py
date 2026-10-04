@@ -132,6 +132,50 @@ def test_the_session_token_is_the_only_way_in(v):
     assert _raw(f"{SHARE}/media/v1/{v.link}/content?q=preview&t={v.session}", "bytes=0-9")[0] == 404
 
 
+def test_a_beacon_is_merged_and_the_roster_reports_it(v):
+    import base64
+    bits = "1" * 60 + "0" * 40                       # watched 60% of the clip
+    raw = int(bits.ljust(104, "0"), 2).to_bytes(13, "big")
+    code, _ = _req("POST", f"{SHARE}/media/v1/{v.link}/playback?t={v.session}",
+                   body={"buckets": 100, "coverage": base64.b64encode(raw).decode(),
+                         "duration_ms": 4000, "furthest_ms": 2400, "plays": 1, "quality": "hd"})
+    assert code == 200
+    code, roster = _req("GET", f"{SHARE}/share/v1/links/{v.link}/audience", headers=v.h)
+    assert code == 200, roster
+    row = roster["audience"][0]
+    assert row["email"] == "expected@example.com"
+    assert row["verified"] is False and row["on_allowlist"] is True
+    # 60 of the 99 counted buckets: the unplayed last bucket is not held against them
+    assert row["coverage_pct"] == 61 and row["furthest_pct"] == 60
+    assert row["completed"] is False and row["dropoff_seconds"] == 2
+    assert roster["unverified_note"] and roster["totals"]["retention"][:1] == [100]
+
+
+def test_the_sidecar_lands_beside_the_video_and_reads_back_through_the_bridge(v):
+    import csv
+    import io
+    code, rep = _req("POST", f"{SHARE}/share/v1/links/{v.link}/audience/flush", headers=v.h)
+    assert code == 200, rep
+    assert rep["error"] is None, rep
+    assert "audience.csv" in rep["written"] + rep["unchanged"]
+    _c, kids = _req("GET", f"{BRIDGE}/v1/files/{v.uid}/renditions", headers=v.h)
+    names = {e["name"]: e["uid"] for e in kids["entries"]}
+    assert "audience.csv" in names and f"audience-{v.link}.csv" in names
+    _c, body = _req("GET", f"{BRIDGE}/v1/files/{names['audience.csv']}/content", headers=v.h)
+    assert body[:3] == b"\xef\xbb\xbf"
+    rows = list(csv.DictReader(io.StringIO(body[3:].decode())))
+    mine = [r for r in rows if r["link_uid"] == v.link]
+    assert mine and mine[0]["email"] == "expected@example.com"
+    assert mine[0]["verified"] == "false" and mine[0]["coverage_pct"] == "61"
+    v.sidecar_versions = len(_req("GET", f"{BRIDGE}/v1/files/{names['audience.csv']}/versions",
+                                  headers=v.h)[1].get("versions", []))
+    # Nothing changed, so a second flush writes no new version.
+    _req("POST", f"{SHARE}/share/v1/links/{v.link}/audience/flush", headers=v.h)
+    again = len(_req("GET", f"{BRIDGE}/v1/files/{names['audience.csv']}/versions",
+                     headers=v.h)[1].get("versions", []))
+    assert again == v.sidecar_versions
+
+
 def test_revoking_the_link_stops_the_viewing_on_the_next_request(v):
     url = f"{SHARE}/media/v1/{v.link}/content?q=hd&t={v.session}"
     assert _raw(url, "bytes=0-9")[0] == 206

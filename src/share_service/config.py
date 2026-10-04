@@ -165,7 +165,7 @@ class Config:
             e.strip() for e in
             _env("SHARE_ATTENTION_EVENTS",
                  "drop_received,otp_send_failed,link_dead,first_redemption,link_locked,"
-                 "media_popular,media_parked").split(",")
+                 "media_popular,media_parked,media_completed").split(",")
             if e.strip())
 
         # --- This service's own Postgres (PRIVATE SHARE_*) -----------------
@@ -305,6 +305,16 @@ class Config:
         self.media_meter_flush_seconds = _int("SHARE_MEDIA_METER_FLUSH_SECONDS", 10)
         self.media_min_throughput_bps = _int("SHARE_MEDIA_MIN_THROUGHPUT_BPS", 8192)
         self.media_throughput_grace_seconds = _int("SHARE_MEDIA_THROUGHPUT_GRACE_SECONDS", 60)
+        # Playback telemetry (§7.4). Off = no beacon route, no rows, and the
+        # UI says so rather than drawing empty charts.
+        self.playback_tracking = _bool("SHARE_PLAYBACK_TRACKING", True)
+        self.playback_complete_pct = _int("SHARE_PLAYBACK_COMPLETE_PCT", 95)
+        self.playback_bytes_complete_pct = _int("SHARE_PLAYBACK_BYTES_COMPLETE_PCT", 90)
+        self.playback_max_buckets = min(1000, _int("SHARE_PLAYBACK_MAX_BUCKETS", 1000))
+        # The audience sidecar (§8).
+        self.audience_csv_enabled = _bool("SHARE_AUDIENCE_CSV_ENABLED", True)
+        self.audience_csv_interval_seconds = _int("SHARE_AUDIENCE_CSV_INTERVAL_SECONDS", 300)
+        self.audience_csv_per_link_max = _int("SHARE_AUDIENCE_CSV_PER_LINK_MAX", 10)
         # /claim is a free write endpoint for anyone holding the URL (§7.3).
         self.claim_rate_per_hour = _int("SHARE_CLAIM_RATE_PER_HOUR", 10)
 
