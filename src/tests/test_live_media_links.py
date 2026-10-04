@@ -200,10 +200,16 @@ def _published(s):
     return st
 
 
-def test_open_mode_is_off_by_default_on_the_running_service(s):
+def test_an_open_link_needs_the_switch_and_the_confirmation_on_the_running_service(s):
+    # The running service's switch (a dev .env may turn open mode on for the
+    # embed E2E). Off: refused outright. On: still refused without the
+    # confirmation and a public title.
     code, body = _req("POST", f"{SHARE}/share/v1/nodes/{s.uid}/links", headers=s.h,
-                      body={"kind": 3, "access_mode": "open", "confirm_public": True})
-    assert code == 403, body
+                      body={"kind": 3, "access_mode": "open", "recipients": []})
+    if s.cfg.allow_open_mode:
+        assert code == 400, body
+    else:
+        assert code == 403, body
 
 
 def test_minting_publishes_and_the_consumer_makes_the_link_ready(s):
