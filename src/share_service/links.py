@@ -122,6 +122,7 @@ class Link:
     output_bytes: Optional[int] = None
     poster_uid: Optional[str] = None
     parked_until: Optional[datetime] = None
+    allow_download: bool = False
 
     @property
     def is_revoked(self) -> bool:
@@ -177,7 +178,7 @@ _COLUMNS = """link_uid, kind, resource_uid, created_by, created_at, expires_at,
               locked_until, note, resource_depth, resource_path,
               access_mode, max_viewers, allowed_embed_origins, display_name,
               media_state, media_version, duration_ms, output_bytes, poster_uid,
-              parked_until"""
+              parked_until, allow_download"""
 
 
 def _row_to_link(row: tuple) -> Link:
@@ -195,7 +196,8 @@ def _row_to_link(row: tuple) -> Link:
         allowed_embed_origins=list(row[28]) if row[28] else None,
         display_name=row[29], media_state=row[30], media_version=row[31],
         duration_ms=row[32], output_bytes=row[33],
-        poster_uid=str(row[34]) if row[34] else None, parked_until=row[35])
+        poster_uid=str(row[34]) if row[34] else None, parked_until=row[35],
+        allow_download=bool(row[36]))
 
 
 # --- writes --------------------------------------------------------------
@@ -221,7 +223,7 @@ def create(conn, *, kind: int, resource_uid: str, created_by: str,
         "access_mode": ACCESS_VERIFIED, "max_viewers": 0,
         "allowed_embed_origins": None, "display_name": None, "media_state": None,
         "media_version": None, "duration_ms": None, "output_bytes": None,
-        "poster_uid": None,
+        "poster_uid": None, "allow_download": False,
     }
     # Reject rather than ignore. Filtering silently to the known keys turns a
     # typo — or a newly added budget the INSERT does not carry yet — into a
@@ -241,9 +243,9 @@ def create(conn, *, kind: int, resource_uid: str, created_by: str,
                   landing_prefix, ext_allowlist, note, archive_bytes,
                   resource_depth, resource_path, access_mode, max_viewers,
                   allowed_embed_origins, display_name, media_state, media_version,
-                  duration_ms, output_bytes, poster_uid)
+                  duration_ms, output_bytes, poster_uid, allow_download)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             (link_uid, kind, resource_uid, hash_secret(secret), created_by, expires_at,
              fields["max_uses"], fields["max_uses_per_recipient"], fields["max_bytes"],
              fields["max_file_bytes"], fields["max_files"], fields["pinned_version"],
@@ -253,7 +255,7 @@ def create(conn, *, kind: int, resource_uid: str, created_by: str,
              fields["resource_path"], fields["access_mode"], fields["max_viewers"],
              fields["allowed_embed_origins"], fields["display_name"],
              fields["media_state"], fields["media_version"], fields["duration_ms"],
-             fields["output_bytes"], fields["poster_uid"]))
+             fields["output_bytes"], fields["poster_uid"], bool(fields["allow_download"])))
 
         for email in recipients:
             cur.execute(

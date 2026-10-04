@@ -70,7 +70,7 @@ from .core_client import READ, WRITE, VersionGone, for_creator
 from .ldap_roles import LdapUnavailable, UnknownUser, resolve_share_roles
 from . import notify
 from .notify import get_publisher
-from .schema import KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD, KIND_UPLOAD
+from .schema import KIND_FILE_DOWNLOAD, KIND_FOLDER_DOWNLOAD, KIND_MEDIA, KIND_UPLOAD
 from .tenant_state import TenantStateGate
 
 log = logging.getLogger("share_service.public")
@@ -342,6 +342,15 @@ def peek(link_uid: str, request: Request, k: Optional[str] = None,
     filename and size.
     """
     cfg, tenant, conn, link = _resolve(request, link_uid, x_share_secret or k)
+    if link.kind == KIND_MEDIA:
+        # A media link is played through the media door, on its own origin
+        # (MEDIA_SHARE.md §6.5). The landing page learns where — and nothing
+        # else here; the door's own peek says the rest.
+        conn.close()
+        from .urls import media_origin
+        return _json({"kind": KIND_MEDIA, "expires_at": link.expires_at,
+                      "media_base": media_origin(cfg, request, tenant) if cfg.media_enabled else "",
+                      "media_enabled": bool(cfg.media_enabled)})
     try:
         payload = {
             "kind": link.kind,
@@ -514,6 +523,11 @@ def open_session(link_uid: str, body: SessionIn, request: Request,
     failed or abandoned challenge never costs the creator anything.
     """
     cfg, tenant, conn, link = _resolve(request, link_uid, x_share_secret or k)
+    if link.kind == KIND_MEDIA:
+        # Media is played through the door, which meters by bytes and viewers;
+        # a download-style redemption here would bypass all of it.
+        conn.close()
+        raise _deny()
     email = links.normalize_email(body.email)
     addr = client_addr(request)
     try:
@@ -786,6 +800,9 @@ def content(link_uid: str, request: Request, k: Optional[str] = None,
     member after the header is on the wire produces a corrupt download.
     """
     cfg, tenant, conn, link = _resolve(request, link_uid, x_share_secret or k)
+    if link.kind == KIND_MEDIA:
+        conn.close()
+        raise _deny()
     closed = False
     try:
         # The redemption may arrive as a header (XHR) or a query parameter. The

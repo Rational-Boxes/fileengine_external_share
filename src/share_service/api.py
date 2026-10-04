@@ -84,6 +84,8 @@ class CreateLinkRequest(BaseModel):
     max_viewers: int = 0
     allowed_embed_origins: Optional[List[str]] = None
     display_name: Optional[str] = None
+    # May viewers save a copy? Unset = by mode: yes for verified, no otherwise.
+    allow_download: Optional[bool] = None
 
 
 #: What the creator of an open link is shown and must acknowledge (§5 rule 4).
@@ -146,7 +148,8 @@ def _link_json(link: links.Link, *, status_override: Optional[str] = None) -> di
             "allowed_embed_origins": link.allowed_embed_origins,
             "display_name": link.display_name, "media_state": link.media_state,
             "media_version": link.media_version, "duration_ms": link.duration_ms,
-            "output_bytes": link.output_bytes, "poster_uid": link.poster_uid}
+            "output_bytes": link.output_bytes, "poster_uid": link.poster_uid,
+            "allow_download": link.allow_download}
            if link.kind == KIND_MEDIA else {}),
     }
 
@@ -502,6 +505,8 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
                 "allowed_embed_origins": embed_origins,
                 "display_name": display_name,
                 "poster_uid": poster_uid,
+                "allow_download": (body.allow_download if body.allow_download is not None
+                                   else mode == ACCESS_VERIFIED),
                 **media_fields} if is_media else {}))
 
         if snap is not None:

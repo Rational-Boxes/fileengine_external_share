@@ -230,6 +230,10 @@ def _ddl(schema: str) -> list[str]:
         # Rung 3 of the media ladder (§6.9): until when a link is parked. NOT a
         # revocation — anyone holding the URL could otherwise destroy the link.
         f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS parked_until TIMESTAMPTZ;",
+        # Whether the viewer may save a copy (§10): defaults true for a verified
+        # link (a client receiving a deliverable usually wants the file), false
+        # otherwise (a public video need not advertise a direct file URL).
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS allow_download BOOLEAN NOT NULL DEFAULT false;",
 
         # --- share_link_audience (MEDIA_SHARE.md §7.1) ----------------------
         # NOT share_link_recipients. That table is an ALLOWLIST written by an

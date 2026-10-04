@@ -168,7 +168,11 @@ def install_hardening(app) -> None:
             response = JSONResponse({"error": "internal"}, status_code=500)
         for k, v in _HARDENING.items():
             response.headers[k] = v
-        response.headers["Content-Disposition"] = "inline"
+        # inline everywhere — except the download route, which alone may say
+        # attachment (with a filename), and only for an allowlisted media type.
+        if not (request.url.path.endswith("/download")
+                and (response.headers.get("content-disposition") or "").startswith("attachment")):
+            response.headers["Content-Disposition"] = "inline"
         if "content-security-policy" not in response.headers:
             response.headers["Content-Security-Policy"] = _DEFAULT_CSP
         cc = response.headers.get("cache-control", "")
@@ -385,7 +389,7 @@ def peek(link_uid: str, request: Request, k: Optional[str] = None,
         "mode": link.access_mode, "title": link.display_name, "duration_ms": link.duration_ms,
         "poster": f"{router.prefix}/{link_uid}/poster" if link.poster_uid else None,
         "state": state, "progress_pct": None, "requires": requires,
-        "allow_download": False, "sources": sources,
+        "allow_download": bool(link.allow_download), "sources": sources,
         # The player sends no beacon when this is false, and the page says so.
         "tracking": bool(cfg.playback_tracking),
     }
@@ -670,10 +674,23 @@ def _plan(range_header: Optional[str], total: int):
 @router.get("/{link_uid}/content")
 def content(link_uid: str, request: Request, q: str = "hd", t: Optional[str] = None):
     """Bytes for a viewing session. ``t`` is the session; ``q`` an enum."""
+    return _serve(link_uid, request, q, t, download=False)
+
+
+@router.get("/{link_uid}/download")
+def download(link_uid: str, request: Request, t: Optional[str] = None):
+    """Save a copy, where the creator allowed it (§10): the MOST COMPATIBLE
+    artifact — the 720p WebM for video, the MP3 for audio — not whichever source
+    the player picked. Same session, authority, budgets and metering as play."""
+    return _serve(link_uid, request, None, t, download=True)
+
+
+def _serve(link_uid: str, request: Request, q: Optional[str], t: Optional[str], *,
+           download: bool):
     cfg = _cfg(request)
     if not cfg.enabled or not cfg.media_enabled or not get_emitter(cfg).available:
         raise _deny()
-    if not t or q not in QUALITIES:
+    if not t or (not download and q not in QUALITIES):
         raise _deny()
     tenant = _tenant_for(cfg, link_uid)
     conn = db.connect_for_tenant(cfg, tenant, provision=True)
@@ -689,6 +706,8 @@ def content(link_uid: str, request: Request, q: str = "hd", t: Optional[str] = N
                         (hashlib.sha256(t.encode()).digest(), link_uid))
             row = cur.fetchone()
         if not row or link.kind != KIND_MEDIA or link.status() != "active":
+            raise _deny()
+        if download and not link.allow_download:
             raise _deny()
         session_uid, audience_uid = str(row[0]), (str(row[1]) if row[1] else None)
         if not public._tenant_admits(cfg, tenant):
@@ -707,6 +726,8 @@ def content(link_uid: str, request: Request, q: str = "hd", t: Optional[str] = N
             _end_session(conn, cfg, tenant, link, session_uid, "revoked")
             raise _deny()
         _v, fmts = _published_set(cfg, tenant, link, roles)
+        if download:
+            q = "hd" if "media" in fmts else "mp3"
         entry = fmts.get(QUALITIES[q])
         mime = _FMT_MIME.get((QUALITIES[q], entry["ext"])) if entry else None
         if not entry or not mime:
@@ -744,6 +765,10 @@ def content(link_uid: str, request: Request, q: str = "hd", t: Optional[str] = N
     headers["Content-Length"] = str(length)
     if crange:
         headers["Content-Range"] = crange
+    if download:
+        safe = re.sub(r"[^A-Za-z0-9 ._-]", "", link.display_name or "video").strip() or "video"
+        headers["Content-Disposition"] = f'attachment; filename="{safe}.{entry["ext"]}"'
+        headers["Cache-Control"] = "no-store"
     _count("requests", tenant, "ok")
     gen = _stream(cfg, tenant, link, roles, entry["uid"], start, length, session_uid,
                   audience_uid, decision.ticket, total=total)

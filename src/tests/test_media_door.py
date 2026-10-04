@@ -675,3 +675,60 @@ def test_the_media_door_serves_no_other_kind(w):
                                 recipients=["a@example.com"], tenant=TENANT)
     conn.close()
     assert w.client.get(f"/media/v1/{link.link_uid}?k={secret}").status_code == 404
+
+
+# ── MS7: download, the landing page's peek, and the poster is not a view ─────────
+
+def test_download_is_offered_only_where_allowed_and_serves_the_720p_as_an_attachment(w):
+    link, _s, s = _session(w, allow_download=True)
+    r = w.client.get(f"/media/v1/{link}/download?t={s['session']}")
+    assert r.status_code == 200 and r.content == PAYLOAD
+    assert r.headers["content-type"] == "video/webm"
+    assert r.headers["content-disposition"] == 'attachment; filename="Walkthrough.webm"'
+    assert r.headers["x-content-type-options"] == "nosniff"
+    # Metered exactly like play: it is the same bytes leaving.
+    assert _row(w, "SELECT bytes_consumed FROM share_links WHERE link_uid = %s",
+                link)[0] == len(PAYLOAD)
+    shut, _s2, s2 = _session(w, allow_download=False)
+    assert w.client.get(f"/media/v1/{shut}/download?t={s2['session']}").status_code == 404
+    assert w.client.get(f"/media/v1/{link}/download?t=forged").status_code == 404
+
+
+def test_only_the_download_route_may_say_attachment(w):
+    link, _s, s = _session(w, allow_download=True)
+    assert _get(w, link, s["session"]).headers["content-disposition"] == "inline"
+
+
+def test_peek_says_whether_download_is_allowed(w):
+    link, secret = _mint(w, "verified", recipients=["v@example.com"], allow_download=True)
+    assert w.client.get(f"/media/v1/{link}?k={secret}").json()["allow_download"] is True
+
+
+def test_the_landing_peek_for_a_media_link_names_the_door_and_nothing_else(w):
+    w.cfg.media_base_url = "https://{tenant}-media.example.com"
+    link, secret = _mint(w, "claimed")
+    r = w.client.get(f"/share/v1/public/{link}", headers={"X-Share-Secret": secret})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["kind"] == 3 and body["media_base"] == f"https://{TENANT}-media.example.com"
+    assert set(body) == {"kind", "expires_at", "media_base", "media_enabled"}
+
+
+def test_the_generic_share_routes_never_serve_a_media_link(w):
+    link, secret = _mint(w, "verified", recipients=["v@example.com"])
+    h = {"X-Share-Secret": secret, "X-Recipient-Token": "good-token"}
+    assert w.client.post(f"/share/v1/public/{link}/session", json={"email": "v@example.com"},
+                         headers=h).status_code == 404
+    assert w.client.get(f"/share/v1/public/{link}/content?k={secret}&redemption=x").status_code == 404
+
+
+def test_a_poster_fetch_is_never_counted_as_a_view(w):
+    """Mail-privacy proxies fetch every image in a message. A poster fetch opens
+    no session, adds no viewer and writes no audit event (§9.4, §12.1)."""
+    link, secret = _mint(w, "claimed")
+    before = list(w.em.actions())
+    for _ in range(5):
+        assert w.client.get(f"/media/v1/{link}/poster?k={secret}").status_code == 200
+    assert _row(w, "SELECT count(*) FROM share_media_sessions WHERE link_uid = %s", link)[0] == 0
+    assert _row(w, "SELECT count(*) FROM share_link_audience WHERE link_uid = %s", link)[0] == 0
+    assert w.em.actions() == before
