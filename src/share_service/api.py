@@ -84,7 +84,8 @@ class CreateLinkRequest(BaseModel):
     max_viewers: int = 0
     allowed_embed_origins: Optional[List[str]] = None
     display_name: Optional[str] = None
-    # May viewers save a copy? Unset = by mode: yes for verified, no otherwise.
+    # May viewers save a copy? Unset = no, in every mode: a media link is the
+    # player only (owner's decision 2026-10-04). A caller can still ask for it.
     allow_download: Optional[bool] = None
 
 
@@ -520,8 +521,7 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
                 "allowed_embed_origins": embed_origins,
                 "display_name": display_name,
                 "poster_uid": poster_uid,
-                "allow_download": (body.allow_download if body.allow_download is not None
-                                   else mode == ACCESS_VERIFIED),
+                "allow_download": bool(body.allow_download),
                 **media_fields} if is_media else {}))
 
         if snap is not None:
