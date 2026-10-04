@@ -823,3 +823,59 @@ def test_an_open_link_embeddable_anywhere_echoes_the_origin_never_star(w):
     assert r.headers["access-control-allow-origin"] == "https://anyone.example"
     assert "frame-ancestors *" in w.client.get(
         f"/media/v1/player/{link}?k={secret}").headers["content-security-policy"]
+
+
+# ── the verified path, called cross-origin (production 2026-10-04) ─────────────────────
+#
+# The landing page lives on the TENANT origin and the door on <tenant>-media, so
+# every door call is cross-origin. identify/verify were the outside-share door's
+# handlers verbatim and carried no CORS: the browser threw away a 200 the server
+# had acted on (the code email arrived) and the page showed "not available".
+
+def _verified(w, monkeypatch, ok_code="123456"):
+    from share_service import otp_client as oc
+    monkeypatch.setattr(oc, "send_code", lambda *a, **k: oc.ChallengeResult(sent=True))
+    monkeypatch.setattr(oc, "verify_code", lambda c, **k: oc.VerifyResult(
+        ok=k["code"] == ok_code, recipient_token="good-token" if k["code"] == ok_code else None))
+    return _mint(w, "verified", recipients=["viewer@example.com"],
+                 allowed_embed_origins=["https://tenant.example"])
+
+
+def _post(w, link, secret, route, body, origin="https://tenant.example"):
+    return w.client.post(f"/media/v1/{link}/{route}?k={secret}", headers={
+        "Content-Type": "text/plain", "Origin": origin}, content=__import__("json").dumps(body))
+
+
+def test_identify_answers_cross_origin(w, monkeypatch):
+    link, secret = _verified(w, monkeypatch)
+    r = _post(w, link, secret, "identify", {"email": "viewer@example.com"})
+    assert r.status_code == 200 and r.json()["status"] == "sent_if_authorized"
+    assert r.headers["access-control-allow-origin"] == "https://tenant.example"
+    # Uniform for an unlisted address too — and just as readable.
+    r = _post(w, link, secret, "identify", {"email": "stranger@example.com"})
+    assert r.status_code == 200
+    assert r.headers["access-control-allow-origin"] == "https://tenant.example"
+
+
+def test_verify_answers_cross_origin_right_code_or_wrong(w, monkeypatch):
+    link, secret = _verified(w, monkeypatch)
+    good = _post(w, link, secret, "verify", {"email": "viewer@example.com", "code": "123456"})
+    assert good.status_code == 200 and good.json()["recipient_token"] == "good-token"
+    assert good.headers["access-control-allow-origin"] == "https://tenant.example"
+    bad = _post(w, link, secret, "verify", {"email": "viewer@example.com", "code": "000000"})
+    assert bad.status_code == 401
+    assert bad.headers["access-control-allow-origin"] == "https://tenant.example"
+
+
+def test_the_verified_path_never_echoes_a_foreign_origin(w, monkeypatch):
+    link, secret = _verified(w, monkeypatch)
+    r = _post(w, link, secret, "identify", {"email": "viewer@example.com"},
+              origin="https://evil.example")
+    assert "access-control-allow-origin" not in r.headers
+    _assert_hardened(r)
+
+
+def test_the_verified_path_refuses_a_non_media_link_uniformly(w, monkeypatch):
+    link, secret = _verified(w, monkeypatch)
+    assert _post(w, link, "wrong-secret", "identify",
+                 {"email": "viewer@example.com"}).status_code == 404

@@ -511,24 +511,45 @@ def peek(link_uid: str, request: Request, k: Optional[str] = None,
     return _json(payload, headers=cors)
 
 
+def _gated(link_uid: str, request: Request, secret: Optional[str], fn) -> Response:
+    """The verified path borrows the outside-share door's identify/verify, which
+    know nothing of this origin's CORS. The landing page calls them from the
+    TENANT's origin, so without the header the browser discarded a 200 the
+    server had acted on: production 2026-10-04, the code email arrived and the
+    page said "This link isn't available". Refusals carry it too — a 401 the
+    page cannot read is a wrong code it cannot report."""
+    cfg, tenant, conn, link = _resolve(request, link_uid, secret)
+    conn.close()
+    cors = _cors(cfg, request, tenant, link)
+    try:
+        r = fn()
+    except HTTPException as e:
+        detail = e.detail if isinstance(e.detail, dict) else {"error": "not_found"}
+        r = _json(detail, status_code=e.status_code, headers=dict(e.headers or {}))
+    r.headers.update(cors)
+    return r
+
+
 @router.post("/{link_uid}/identify")
 async def identify(link_uid: str, request: Request, k: Optional[str] = None,
                    x_share_secret: Optional[str] = Header(default=None)) -> Response:
     """The verified path's code request — the outside-share door's own logic."""
     body = await _body(request)
-    return await run_in_threadpool(public.identify, link_uid,
-                                   public.IdentifyIn(email=str(body.get("email") or "")),
-                                   request, k, x_share_secret)
+    return await run_in_threadpool(
+        _gated, link_uid, request, x_share_secret or k,
+        lambda: public.identify(link_uid, public.IdentifyIn(email=str(body.get("email") or "")),
+                                request, k, x_share_secret))
 
 
 @router.post("/{link_uid}/verify")
 async def verify(link_uid: str, request: Request, k: Optional[str] = None,
                  x_share_secret: Optional[str] = Header(default=None)) -> Response:
     body = await _body(request)
-    return await run_in_threadpool(public.verify, link_uid,
-                                   public.VerifyIn(email=str(body.get("email") or ""),
-                                                   code=str(body.get("code") or "")),
-                                   request, k, x_share_secret)
+    return await run_in_threadpool(
+        _gated, link_uid, request, x_share_secret or k,
+        lambda: public.verify(link_uid, public.VerifyIn(email=str(body.get("email") or ""),
+                                                        code=str(body.get("code") or "")),
+                              request, k, x_share_secret))
 
 
 @router.post("/{link_uid}/claim")
