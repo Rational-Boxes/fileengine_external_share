@@ -123,8 +123,13 @@ def test_claim_opens_a_session_and_the_bytes_match_the_published_rendition(v):
 
 
 def test_the_link_was_charged_for_exactly_what_was_sent(v):
-    _c, link = _req("GET", f"{SHARE}/share/v1/links/{v.link}", headers=v.h)
-    assert link["bytes_consumed"] == v.charged
+    # The last flush runs as the stream's generator closes, which can land a
+    # moment after the client has its final byte — so poll briefly, then exact.
+    got = _wait("the final byte accounting", 10,
+                lambda: (lambda n: n if n == v.charged else None)(
+                    _req("GET", f"{SHARE}/share/v1/links/{v.link}", headers=v.h)[1]
+                    .get("bytes_consumed")))
+    assert got == v.charged
 
 
 def test_the_session_token_is_the_only_way_in(v):
@@ -174,6 +179,31 @@ def test_the_sidecar_lands_beside_the_video_and_reads_back_through_the_bridge(v)
     again = len(_req("GET", f"{BRIDGE}/v1/files/{names['audience.csv']}/versions",
                      headers=v.h)[1].get("versions", []))
     assert again == v.sidecar_versions
+
+
+def test_erasing_the_address_clears_it_from_the_sidecar_and_its_history(v):
+    """Decided 2026-10-04: the core keeps one version of a hidden audience CSV,
+    so regenerating after an erasure leaves the address in no version at all."""
+    # One more change first, so audience.csv has more than one version to cull.
+    code, _ = _req("POST", f"{SHARE}/media/v1/{v.link}/claim?k={v.secret}",
+                   body={"email": "second@example.com", "consent": True})
+    assert code == 200
+    _req("POST", f"{SHARE}/share/v1/links/{v.link}/audience/flush", headers=v.h)
+    _c, kids = _req("GET", f"{BRIDGE}/v1/files/{v.uid}/renditions", headers=v.h)
+    rollup = next(e["uid"] for e in kids["entries"] if e["name"] == "audience.csv")
+    before = _req("GET", f"{BRIDGE}/v1/files/{rollup}/versions", headers=v.h)[1]["versions"]
+    assert len(before) == 1                  # every write already retired the last
+    code, out = _req("POST", f"{SHARE}/share/v1/admin/audience/erase", headers=v.h,
+                     body={"email": "expected@example.com"})
+    assert code == 200, out
+    assert out["rows"] == 1
+    rep = out["reports"][0]
+    assert rep["error"] is None, rep
+    assert "audience.csv" in rep["written"]
+    after = _req("GET", f"{BRIDGE}/v1/files/{rollup}/versions", headers=v.h)[1]["versions"]
+    assert len(after) == 1
+    _c, body = _req("GET", f"{BRIDGE}/v1/files/{rollup}/content", headers=v.h)
+    assert b"expected@example.com" not in body and b"second@example.com" in body
 
 
 def test_revoking_the_link_stops_the_viewing_on_the_next_request(v):

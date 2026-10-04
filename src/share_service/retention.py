@@ -152,11 +152,15 @@ def _drop_media_sidecar(config: Config, tenant: str, conn, link_uid: str,
     with for_creator(config, created_by=link.created_by, roles=roles, tenant=tenant) as core:
         for e in core.client.dir(resource_uid) or []:
             if str(getattr(e, "name", "")) == name:
+                # Scrubbed before the soft delete; the core keeps one version of
+                # a sidecar, so the removed file holds no addresses at all.
+                audience.scrub(core, str(e.uid))
                 core.client.remove(str(e.uid))
     with conn.cursor() as cur:
         cur.execute("DELETE FROM share_audience_sidecars WHERE resource_uid = %s AND name = %s",
                     (resource_uid, name))
     conn.commit()
+    # The rollup held this link's rows too: regenerate it now.
     audience.mark_dirty(conn, resource_uid, force=True)
 
 

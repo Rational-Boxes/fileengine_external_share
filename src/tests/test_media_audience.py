@@ -42,8 +42,12 @@ class Files:
         self.writes = 0
         self.fail = False
 
+    def history(self, name):
+        return self.files[name][1]
+
     def factory(self, *a, **k):
         outer = self
+        user = k.get("created_by")
 
         class C:
             client = None
@@ -73,13 +77,19 @@ class Files:
                 for n, (u, vs) in outer.files.items():
                     if u == uid:
                         vs.append(body)
+                        # The core's rule (feat/unversioned-audience-sidecars):
+                        # a hidden audience CSV keeps exactly one version.
+                        del vs[:-1]
                 outer.writes += 1
 
             def remove(self, uid):
                 if outer.fail:
                     raise PermissionError("cannot remove")
                 for n in [n for n, (u, _v) in outer.files.items() if u == uid]:
+                    outer.removed = getattr(outer, "removed", {})
+                    outer.removed[n] = outer.files[n]
                     del outer.files[n]
+
         return C()
 
     def csv(self, name):
@@ -400,6 +410,14 @@ def test_erasing_an_address_clears_its_rows_and_rewrites_the_file(w, side):
     assert _row(w, """SELECT count(*) FROM share_media_playback p
                        JOIN share_media_sessions s ON s.session_uid = p.session_uid
                       WHERE s.link_uid = %s""", link)[0] == 1
+    # Nothing in any version of either file still names the address (the core
+    # keeps one version of a sidecar; the live suite checks the real core).
+    for name in (audience.ROLLUP, audience.per_link_name(link)):
+        assert all(gone.encode() not in v for v in side.history(name))
+
+
+def _conn(w):
+    return db.connect_for_tenant(w.cfg, TENANT)
 
 
 def test_retention_removes_the_sidecar_before_the_rows_and_keeps_the_row_if_it_cannot(w, side, monkeypatch):
@@ -419,4 +437,10 @@ def test_retention_removes_the_sidecar_before_the_rows_and_keeps_the_row_if_it_c
     retention.sweep_tenant(w.cfg, TENANT)
     assert _row(w, "SELECT count(*) FROM share_links WHERE link_uid = %s", link)[0] == 0
     assert audience.per_link_name(link) not in side.files
+    # Soft-deleted, so scrubbed first: what remains holds no addresses, in any version.
+    gone = side.removed[audience.per_link_name(link)][1]
+    assert len(gone) == 1 and gone[0] == audience.render([])
+    # ...and the rollup that also held them is due now, not at the next debounce.
+    assert _row(w, "SELECT force FROM share_audience_dirty WHERE resource_uid = %s",
+                w.source)[0] is True
     assert _row(w, "SELECT count(*) FROM share_link_audience WHERE link_uid = %s", link)[0] == 0

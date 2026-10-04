@@ -30,6 +30,13 @@ source (the PII does not outlive the thing it is about).
   written and the per-link files are removed, so crossing the threshold never
   leaves a half-populated set of stale files.
 
+**One version, kept by the core.** The core keeps exactly one version of a
+hidden ``audience.csv`` / ``audience-<uuid>.csv`` (MEDIA_SHARE.md §8.4, decided
+2026-10-04): each write retires the one it superseded, with an accountability
+record. So an erased or purged address is gone from the file's history the moment
+the regenerated file is written — no cull, no extra permission, no extra service
+capability here.
+
 **A projection, never an append.** Postgres is the system of record; the file is
 regenerated in full, debounced (``audience_csv_interval_seconds``), immediately
 on revoke and on demand, and skipped when its content hash has not changed — so
@@ -203,11 +210,13 @@ def project(cfg: Config, tenant: str, resource_uid: str, *,
                     core.client.put_stream(uid, iter([body]))
                     _remember(conn, resource_uid, name, sha, None)
                     report["written"].append(name)
-                # Per-link files that should no longer exist: past the threshold,
-                # or for a link that is gone. Never anything that is not ours.
+                # Per-link files that should no longer exist. Scrubbed before they
+                # are removed: removal is a SOFT delete, so a removed file still
+                # holding addresses would keep them, restorable, indefinitely.
                 for name, uid in existing.items():
                     if (name.startswith("audience-") and name.endswith(".csv")
                             and name not in wanted):
+                        scrub(core, uid)
                         core.client.remove(uid)
                         _forget(conn, resource_uid, name)
                         report["removed"].append(name)
@@ -251,6 +260,13 @@ def _remember(conn, resource_uid, name, sha, error) -> None:
                               last_error = EXCLUDED.last_error""",
                     (resource_uid, name, sha, error, error))
     conn.commit()
+
+
+def scrub(core, uid) -> None:
+    """Overwrite with the header only. The core retires the superseded version
+    in the same write, so what is left — even soft-deleted, even restored —
+    holds no addresses."""
+    core.client.put_stream(uid, iter([render([])]))
 
 
 def _forget(conn, resource_uid, name) -> None:
