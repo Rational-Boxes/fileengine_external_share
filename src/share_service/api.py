@@ -702,6 +702,30 @@ def file_provenance(body: ProvenanceRequest, request: Request,
         for uid, r in visible.items()}}
 
 
+_NO_AUDIENCE = {"viewers": 0, "watched": 0, "completed": 0, "last_seen_at": None}
+
+
+def _media_audience(conn, link_uids: List[str]) -> dict:
+    """Per media link, what the Dashboard says about its viewing: who opened it,
+    who watched any of it, who finished, and when it was last watched. A media
+    link consumes no uses, so the use count it would otherwise show is always 0
+    and says nothing (owner's request 2026-10-04: video shares on the Dashboard
+    with their information, beside the regular ones). One query for the set."""
+    if not link_uids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT link_uid::text, count(*), "
+            "       count(*) FILTER (WHERE plays > 0 OR coverage_pct > 0), "
+            "       count(*) FILTER (WHERE completed_at IS NOT NULL), "
+            "       max(last_seen_at) "
+            "  FROM share_link_audience WHERE link_uid = ANY(%s::uuid[]) GROUP BY 1",
+            (link_uids,))
+        return {r[0]: {"viewers": int(r[1]), "watched": int(r[2]), "completed": int(r[3]),
+                       "last_seen_at": r[4].isoformat() if r[4] else None}
+                for r in cur.fetchall()}
+
+
 @router.get("/links/mine/inbox")
 def sharing_inbox(request: Request,
                   caller: Caller = Depends(get_caller)) -> dict:
@@ -721,6 +745,7 @@ def sharing_inbox(request: Request,
     try:
         live = links.list_for_creator(conn, caller.user, live_only=True)
         counts = {l.link_uid: links.count_recipients(conn, l.link_uid) for l in live}
+        audience = _media_audience(conn, [l.link_uid for l in live if l.kind == KIND_MEDIA])
     finally:
         conn.close()
 
@@ -738,6 +763,8 @@ def sharing_inbox(request: Request,
     for l in live:
         row = _link_json(l)
         row["recipient_count"] = counts.get(l.link_uid, 0)
+        if l.kind == KIND_MEDIA:
+            row["audience"] = audience.get(l.link_uid, dict(_NO_AUDIENCE))
         verdict = verdicts.get(l.link_uid)
         if verdict is not None and not verdict.ok:
             row["status"] = "not_working"
