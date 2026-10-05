@@ -703,6 +703,15 @@ def _open(cfg: Config, request: Request, tenant: str, conn, link, *, mode: str,
         raise _deny()
 
     _count("sessions", tenant, mode)
+    if fresh and mode != ACCESS_OPEN and email:
+        # Once per address — `fresh` is the first row for it — so a replay or a
+        # second device never raises it again. After the audit is durable, so a
+        # refused view never notifies.
+        get_publisher(cfg).publish(
+            notify.MEDIA_OPENED, tenant=tenant, creator=link.created_by,
+            link_uid=link.link_uid, file_uid=link.resource_uid, actor=actor,
+            detail=f"{email} opened \u201c{link.display_name or 'your video'}\u201d"
+                   + (" (unverified address)" if mode == ACCESS_CLAIMED else ""))
     _v, fmts = _published_set(cfg, tenant, link, roles)
     sources = [{**s, "url": s["url"] + f"&t={token}"} for s in _sources(link.link_uid, fmts)]
     audience.mark_dirty(conn, link.resource_uid)

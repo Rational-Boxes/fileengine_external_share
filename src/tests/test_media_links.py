@@ -656,3 +656,43 @@ def test_the_socket_outlasts_the_block(cfg, monkeypatch):
     # redis-py 8 defaults socket_timeout to 5 s — the same as the block — which
     # raised TimeoutError on every quiet poll.
     assert seen["socket_timeout"] > 5
+
+
+# --- the Dashboard's Sharing panel (owner's request 2026-10-04) --------------------
+#
+# Video shares must show on the Dashboard beside the regular ones, with what a
+# media link is FOR: who has watched. A media link consumes no uses, so the use
+# count the panel shows for a file share is always 0 for one and says nothing.
+
+def test_the_dashboard_inbox_carries_a_media_links_audience(world, conn, monkeypatch):
+    monkeypatch.setattr(api.preflight, "check_many", lambda cfg, **k: {})
+    r = _create(world, display_name="Intro video")
+    assert r.status_code == 201, r.text
+    link = r.json()["link_uid"]
+    with conn.cursor() as cur:
+        for email, plays, pct, done in (("a@example.com", 1, 100, True),
+                                        ("b@example.com", 2, 40, False),
+                                        ("c@example.com", 0, 0, False)):   # opened, never played
+            cur.execute(
+                "INSERT INTO share_link_audience (audience_uid, link_uid, email, email_norm, plays, "
+                " coverage_pct, completed_at, completion_basis) VALUES (%s, %s, %s, %s, %s, %s, "
+                " CASE WHEN %s THEN now() END, CASE WHEN %s THEN 'beacon' END)",
+                (str(uuid.uuid4()), link, email, email, plays, pct, done, done))
+    conn.commit()
+
+    body = world.client.get("/share/v1/links/mine/inbox", headers=world.auth).json()
+    row = next(l for g in body.values() for l in g if l["link_uid"] == link)
+    assert row in body["active"]                       # beside the regular shares
+    assert row["kind"] == KIND_MEDIA and row["display_name"] == "Intro video"
+    assert row["audience"]["viewers"] == 3
+    assert row["audience"]["watched"] == 2
+    assert row["audience"]["completed"] == 1
+    assert row["audience"]["last_seen_at"]
+
+
+def test_a_media_link_nobody_has_opened_still_reports_an_audience(world, conn, monkeypatch):
+    monkeypatch.setattr(api.preflight, "check_many", lambda cfg, **k: {})
+    link = _create(world).json()["link_uid"]
+    body = world.client.get("/share/v1/links/mine/inbox", headers=world.auth).json()
+    row = next(l for g in body.values() for l in g if l["link_uid"] == link)
+    assert row["audience"] == {"viewers": 0, "watched": 0, "completed": 0, "last_seen_at": None}

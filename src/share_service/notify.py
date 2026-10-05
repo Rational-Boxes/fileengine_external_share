@@ -55,6 +55,11 @@ MEDIA_POPULAR = "media_popular"
 MEDIA_PARKED = "media_parked"
 # "Priya finished your introduction video" (§7.4) — gated links only.
 MEDIA_COMPLETED = "media_completed"
+# "Priya opened your introduction video" — the FIRST time an address opens the
+# link, never on a replay; gated links only, like completed (an open link's
+# anonymous viewers would flood the feed). Owner's request 2026-10-04: the
+# creator should know the recipient has accessed the media.
+MEDIA_OPENED = "media_opened"
 
 
 class EventPublisher:

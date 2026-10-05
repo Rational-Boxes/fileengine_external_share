@@ -899,3 +899,41 @@ def test_the_verified_path_refuses_a_non_media_link_uniformly(w, monkeypatch):
     link, secret = _verified(w, monkeypatch)
     assert _post(w, link, "wrong-secret", "identify",
                  {"email": "viewer@example.com"}).status_code == 404
+
+
+# ── attention items: the creator learns the recipient opened it (2026-10-04) ──────────
+
+def _opened(w):
+    return [k for ev, k in w.published if ev == "media_opened"]
+
+
+def test_the_first_open_by_an_address_tells_the_creator_once(w):
+    link, secret = _mint(w, "claimed")
+    assert _claim(w, link, secret, email="Pat@Example.com").status_code == 200
+    got = _opened(w)
+    assert len(got) == 1
+    assert got[0]["creator"] == CREATOR and got[0]["link_uid"] == link
+    assert got[0]["detail"] == "pat@example.com opened “Walkthrough” (unverified address)"
+    # A replay, or the same address again: the creator already knows.
+    assert _claim(w, link, secret, email="pat@example.com").status_code == 200
+    assert len(_opened(w)) == 1
+    # A second recipient is news.
+    assert _claim(w, link, secret, email="sam@example.com").status_code == 200
+    assert len(_opened(w)) == 2
+
+
+def test_a_verified_open_is_reported_without_the_unverified_caveat(w):
+    link, secret = _mint(w, "verified", recipients=["v@example.com"])
+    r = w.client.post(f"/media/v1/{link}/session?k={secret}", headers={"Content-Type": "text/plain"},
+                      content=__import__("json").dumps({"email": "v@example.com",
+                                                        "recipient_token": "good-token"}))
+    assert r.status_code == 200
+    assert [k["detail"] for k in _opened(w)] == ["v@example.com opened “Walkthrough”"]
+
+
+def test_an_open_links_anonymous_viewers_raise_nothing(w):
+    link, secret = _mint(w, "open")
+    for _ in range(3):
+        assert w.client.post(f"/media/v1/{link}/session?k={secret}",
+                             headers={"Content-Type": "text/plain"}, content="{}").status_code == 200
+    assert _opened(w) == []

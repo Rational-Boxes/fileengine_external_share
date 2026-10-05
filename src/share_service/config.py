@@ -165,7 +165,7 @@ class Config:
             e.strip() for e in
             _env("SHARE_ATTENTION_EVENTS",
                  "drop_received,otp_send_failed,link_dead,first_redemption,link_locked,"
-                 "media_popular,media_parked,media_completed").split(",")
+                 "media_popular,media_parked,media_completed,media_opened").split(",")
             if e.strip())
 
         # --- This service's own Postgres (PRIVATE SHARE_*) -----------------
