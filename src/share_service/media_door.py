@@ -617,6 +617,15 @@ def _session(link_uid: str, request: Request, secret: Optional[str], token: str,
         if link.access_mode != ACCESS_VERIFIED:
             raise _deny()
         email = links.normalize_email(str(body.get("email") or ""))
+        # The recipient token outlives the roster: it was issued while the address
+        # was listed and stays valid after the creator removes it. The outside-
+        # share door is protected by consume_use (removed_at IS NULL); a media
+        # session consumes no use, so the roster is asked here, or "Remove" would
+        # be a label rather than a revocation.
+        if email not in {r["email"] for r in links.recipients(conn, link_uid)}:
+            public._audit_denied(cfg, link_uid=link_uid, reason="not_a_recipient",
+                                 tenant=tenant, addr=client_addr(request), email=email)
+            raise _deny()
         try:
             if not otp_client.check_token(cfg, link_uid=link_uid, email=email, token=token):
                 public._audit_denied(cfg, link_uid=link_uid, reason="no_recipient_token",
@@ -1093,6 +1102,25 @@ def _end_session(conn, cfg: Config, tenant: str, link, session_uid: str, reason:
         _audit_end(cfg, tenant, link.link_uid, link.resource_uid, session_uid, reason,
                    int(row[0] or 0), row[1], row[2])
         _session_over(cfg, conn, tenant, link.link_uid, session_uid)
+
+
+def end_recipient_sessions(cfg: Config, conn, tenant: str, link, email: str) -> int:
+    """A recipient removed from a VERIFIED link stops at their next range request,
+    not when their 24 h session runs out. Claimed links are left alone: there the
+    list is only who the creator expects, and anyone may claim any address."""
+    if link.kind != KIND_MEDIA or link.access_mode != ACCESS_VERIFIED:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("""SELECT s.session_uid FROM share_media_sessions s
+                         JOIN share_link_audience a ON a.audience_uid = s.audience_uid
+                        WHERE s.link_uid = %s AND a.email_norm = %s
+                          AND s.mode = 'verified' AND s.ended_at IS NULL""",
+                    (link.link_uid, email))
+        uids = [str(r[0]) for r in cur.fetchall()]
+    conn.commit()
+    for uid in uids:
+        _end_session(conn, cfg, tenant, link, uid, "recipient_removed")
+    return len(uids)
 
 
 def _audit_end(cfg, tenant, link_uid, resource_uid, session_uid, reason, nbytes, opened_at, mode):
