@@ -1008,3 +1008,28 @@ def test_the_remove_route_ends_the_removed_addresss_media_sessions(w):
                         headers=_creator_auth(w.cfg))
     assert r.status_code == 200 and r.json()["changed"] is True, r.text
     assert _get(w, link, s, rng="bytes=0-99").status_code == 404
+
+
+def test_the_roster_records_a_code_sent_a_wrong_code_and_a_verification(w, monkeypatch):
+    # Nothing wrote these three columns, so every drawer roster said "On the list"
+    # for ever and the "code attempts failing" warning could never appear.
+    # Found by e2e/media-recipients.mjs.
+    link, secret = _verified(w, monkeypatch)
+    row = lambda: _row(w, "SELECT last_code_sent_at, failed_codes, first_verified_at "
+                          "FROM share_link_recipients WHERE link_uid = %s", link)
+    assert row() == (None, 0, None)
+    _post(w, link, secret, "identify", {"email": "viewer@example.com"})
+    sent, _f, _v = row()
+    assert sent is not None
+    assert _post(w, link, secret, "verify", {"email": "viewer@example.com",
+                                             "code": "000000"}).status_code == 401
+    assert row()[1] == 1
+    assert _post(w, link, secret, "verify", {"email": "viewer@example.com",
+                                             "code": "123456"}).status_code == 200
+    first = row()[2]
+    assert first is not None
+    _post(w, link, secret, "verify", {"email": "viewer@example.com", "code": "123456"})
+    assert row()[2] == first                                  # the FIRST verification, kept
+    # An unlisted address writes nothing anywhere on the roster.
+    _post(w, link, secret, "identify", {"email": "stranger@example.com"})
+    assert _row(w, "SELECT count(*) FROM share_link_recipients WHERE link_uid = %s", link)[0] == 1
