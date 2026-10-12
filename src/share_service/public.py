@@ -408,6 +408,12 @@ def identify(link_uid: str, body: IdentifyIn, request: Request,
             _audit_denied(cfg, link_uid=link_uid, reason="otp_unavailable",
                           tenant=tenant, addr=addr, email=email)
             raise _deny()
+        if result.sent:
+            conn = db.connect_for_tenant(cfg, tenant)
+            try:
+                links.mark_code_sent(conn, link_uid, email)
+            finally:
+                conn.close()
         if result.send_failed:
             # The creator has to find out: a mail misconfiguration otherwise
             # looks exactly like a mistyped address (spec §6.9). The recipient's
@@ -465,6 +471,7 @@ def verify(link_uid: str, body: VerifyIn, request: Request,
                 distinct_threshold=cfg.link_lockout_distinct,
                 window_minutes=cfg.lockout_window_minutes,
                 lock_minutes=cfg.lockout_minutes)
+            links.count_failed_code(conn, link_uid, email)
         finally:
             conn.close()
 
@@ -504,6 +511,7 @@ def verify(link_uid: str, body: VerifyIn, request: Request,
     conn = db.connect_for_tenant(cfg, tenant, provision=True)
     try:
         links.clear_failed_verifications(conn, link_uid)
+        links.mark_verified(conn, link_uid, email)
     finally:
         conn.close()
 

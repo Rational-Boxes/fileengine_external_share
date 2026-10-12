@@ -35,7 +35,7 @@ from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
-from . import audience, core_client, db, links, media_client, preflight, snapshot as snapshot_mod
+from . import audience, core_client, db, links, media_client, media_door, preflight, snapshot as snapshot_mod
 from .audit import AuditUnavailable, get_emitter
 from .auth import Caller, get_caller
 from .config import Config
@@ -1004,8 +1004,11 @@ def remove_recipient(link_uid: str, email: str, request: Request,
     normalized = links.normalize_email(email)
     conn = db.connect_for_tenant(cfg, caller.tenant, provision=True)
     try:
-        _owned_link(conn, link_uid, caller, cfg)
+        link = _owned_link(conn, link_uid, caller, cfg)
         changed = links.remove_recipient(conn, link_uid, normalized, caller.user)
+        if changed:
+            # A media session consumes no use, so removal must end it outright.
+            media_door.end_recipient_sessions(cfg, conn, caller.tenant, link, normalized)
     finally:
         conn.close()
 

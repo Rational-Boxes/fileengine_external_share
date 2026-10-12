@@ -937,3 +937,99 @@ def test_an_open_links_anonymous_viewers_raise_nothing(w):
         assert w.client.post(f"/media/v1/{link}/session?k={secret}",
                              headers={"Content-Type": "text/plain"}, content="{}").status_code == 200
     assert _opened(w) == []
+
+
+# ── removing a recipient (the media link's roster) ───────────────────────────────
+
+def _creator_auth(cfg) -> dict:
+    import base64, hashlib, hmac, json
+    if not cfg.jwt_secret:
+        pytest.skip("FILEENGINE_JWT_SECRET not configured")
+    b64 = lambda raw: base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    header = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    payload = b64(json.dumps({"sub": CREATOR, "tenant": TENANT,
+                              "roles": {TENANT: ["users"]},
+                              "exp": int(time.time()) + 600}).encode())
+    sig = hmac.new(cfg.jwt_secret.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest()
+    return {"Authorization": f"Bearer {header}.{payload}.{b64(sig)}", "X-Tenant": TENANT}
+
+
+def _verified_session(w, link, secret, email="v@example.com"):
+    return w.client.post(f"/media/v1/{link}/session?k={secret}", json={"email": email},
+                         headers={"X-Recipient-Token": "good-token"})
+
+
+def _remove(w, link, email):
+    conn = db.connect_for_tenant(w.cfg, TENANT)
+    try:
+        assert links.remove_recipient(conn, link, email, CREATOR)
+        return media_door.end_recipient_sessions(w.cfg, conn, TENANT, links.get(conn, link), email)
+    finally:
+        conn.close()
+
+
+def test_a_removed_recipient_cannot_open_a_session_with_a_token_they_already_hold(w):
+    # The recipient token is the OTP service's and outlives the roster; a media
+    # session consumes no use, so without a roster check "Remove" removed nothing.
+    link, secret = _mint(w, "verified", recipients=["v@example.com", "keep@example.com"])
+    _remove(w, link, "v@example.com")
+    assert _verified_session(w, link, secret).status_code == 404
+    assert any(e["action"] == "share_link_denied" and e["detail"]["reason"] == "not_a_recipient"
+               for e in w.em.events)
+    assert _verified_session(w, link, secret, "keep@example.com").status_code == 200
+
+
+def test_removing_a_verified_recipient_stops_their_playback_at_the_next_request(w):
+    link, secret = _mint(w, "verified", recipients=["v@example.com", "keep@example.com"])
+    gone = _verified_session(w, link, secret).json()["session"]
+    kept = _verified_session(w, link, secret, "keep@example.com").json()["session"]
+    assert _get(w, link, gone, rng="bytes=0-99").status_code == 206
+    assert _remove(w, link, "v@example.com") == 1
+    assert _get(w, link, gone, rng="bytes=100-199").status_code == 404
+    assert _get(w, link, kept, rng="bytes=0-99").status_code == 206
+    ends = [e for e in w.em.events if e["action"] == "share_media_session_end"
+            and e["detail"]["link_uid"] == link]
+    assert [e["detail"]["ended"] for e in ends] == ["recipient_removed"]
+
+
+def test_removing_an_expected_address_from_a_claimed_link_ends_nothing(w):
+    # On a claimed link the list is who the creator EXPECTS; anyone may claim any
+    # address, so ending a session would pretend to a control that is not there.
+    link, secret = _mint(w, "claimed", recipients=["viewer@example.com"])
+    s = _claim(w, link, secret).json()["session"]
+    assert _remove(w, link, "viewer@example.com") == 0
+    assert _get(w, link, s, rng="bytes=0-99").status_code == 206
+
+
+def test_the_remove_route_ends_the_removed_addresss_media_sessions(w):
+    link, secret = _mint(w, "verified", recipients=["v@example.com"])
+    s = _verified_session(w, link, secret).json()["session"]
+    r = w.client.delete(f"/share/v1/links/{link}/recipients/v@example.com",
+                        headers=_creator_auth(w.cfg))
+    assert r.status_code == 200 and r.json()["changed"] is True, r.text
+    assert _get(w, link, s, rng="bytes=0-99").status_code == 404
+
+
+def test_the_roster_records_a_code_sent_a_wrong_code_and_a_verification(w, monkeypatch):
+    # Nothing wrote these three columns, so every drawer roster said "On the list"
+    # for ever and the "code attempts failing" warning could never appear.
+    # Found by e2e/media-recipients.mjs.
+    link, secret = _verified(w, monkeypatch)
+    row = lambda: _row(w, "SELECT last_code_sent_at, failed_codes, first_verified_at "
+                          "FROM share_link_recipients WHERE link_uid = %s", link)
+    assert row() == (None, 0, None)
+    _post(w, link, secret, "identify", {"email": "viewer@example.com"})
+    sent, _f, _v = row()
+    assert sent is not None
+    assert _post(w, link, secret, "verify", {"email": "viewer@example.com",
+                                             "code": "000000"}).status_code == 401
+    assert row()[1] == 1
+    assert _post(w, link, secret, "verify", {"email": "viewer@example.com",
+                                             "code": "123456"}).status_code == 200
+    first = row()[2]
+    assert first is not None
+    _post(w, link, secret, "verify", {"email": "viewer@example.com", "code": "123456"})
+    assert row()[2] == first                                  # the FIRST verification, kept
+    # An unlisted address writes nothing anywhere on the roster.
+    _post(w, link, secret, "identify", {"email": "stranger@example.com"})
+    assert _row(w, "SELECT count(*) FROM share_link_recipients WHERE link_uid = %s", link)[0] == 1

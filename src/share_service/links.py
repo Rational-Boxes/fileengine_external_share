@@ -581,6 +581,40 @@ def record_failed_verification(conn, link_uid: str, email: str, *,
     return {"locked": locked, "attempts": attempts, "distinct": distinct}
 
 
+def mark_code_sent(conn, link_uid: str, email: str) -> None:
+    """The roster's "A code was requested" rung. Written only for a listed,
+    live address, so it reveals nothing the roster does not already hold."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE share_link_recipients SET last_code_sent_at = now()
+                WHERE link_uid = %s AND email = %s AND removed_at IS NULL""",
+            (link_uid, email))
+    conn.commit()
+
+
+def mark_verified(conn, link_uid: str, email: str) -> None:
+    """The roster's "Verified" rung: the first time the address proved control
+    of its mailbox on this link. Kept, not overwritten, by later codes."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE share_link_recipients
+                  SET first_verified_at = COALESCE(first_verified_at, now())
+                WHERE link_uid = %s AND email = %s""",
+            (link_uid, email))
+    conn.commit()
+
+
+def count_failed_code(conn, link_uid: str, email: str) -> None:
+    """Per-address wrong codes, for the roster's "code attempts failing"
+    warning. An unlisted address matches no row, so it counts nowhere here."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """UPDATE share_link_recipients SET failed_codes = failed_codes + 1
+                WHERE link_uid = %s AND email = %s""",
+            (link_uid, email))
+    conn.commit()
+
+
 def clear_failed_verifications(conn, link_uid: str) -> None:
     """A verified redemption clears the rolling count (spec §8.4).
 
