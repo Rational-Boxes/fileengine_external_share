@@ -211,6 +211,25 @@ def _require_admin(cfg: Config, caller: Caller) -> None:
                             "tenant administrator role required")
 
 
+# Every data-destruction operation on the platform is gated to the tenant's
+# erasure_admins group (the core enforces the same for ERASE and CULL_VERSIONS).
+# The group name arrives verbatim and the bridge adds the core role beside it, so
+# either spelling counts. system_admin is the deployment's break-glass identity
+# and passes here as it does in the core. Not configurable, deliberately: a
+# widened list would be a quiet way to hand out destruction.
+ERASURE_ROLES = ("erasure_admins", "erasure_admin", "system_admin")
+
+
+def is_erasure_admin(caller: Caller) -> bool:
+    return any(caller.has_role(r) for r in ERASURE_ROLES)
+
+
+def _require_erasure_admin(caller: Caller) -> None:
+    if not is_erasure_admin(caller):
+        raise HTTPException(status.HTTP_403_FORBIDDEN,
+                            "erasure_admins membership required")
+
+
 def _owned_link(conn, link_uid: str, caller: Caller,
                 cfg: Optional[Config] = None) -> links.Link:
     """Fetch a link the caller may act on, or 404.
@@ -1111,11 +1130,11 @@ class EraseAddressRequest(BaseModel):
 @router.post("/admin/audience/erase")
 def erase_audience_address(body: EraseAddressRequest, request: Request,
                            caller: Caller = Depends(get_caller)) -> dict:
-    """An erasure request naming an address (§8.4) — a tenant administrator's
-    action. Clears the address's audience and playback rows in this tenant and
-    regenerates every sidecar that held it."""
+    """An erasure request naming an address (§8.4) — an erasure_admin's action,
+    like every destruction of data. Clears the address's audience and playback
+    rows in this tenant and regenerates every sidecar that held it."""
     cfg = _config(request)
-    _require_admin(cfg, caller)
+    _require_erasure_admin(caller)
     email = links.normalize_email(body.email)
     if not email:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "email required")
