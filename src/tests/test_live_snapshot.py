@@ -58,11 +58,19 @@ def tree(cfg, roles):
     environment and a uniquely-named root keeps runs independent.
     """
     made = {}
-    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
-        c = core.client
-        root_uid = c.mkdir("", f"m1-fixture-{uuid.uuid4().hex[:8]}")
+    # Creating at the tenant root is admin-only in the core, and share's creator
+    # roles are admin-stripped by design. The fixture's scratch root is therefore
+    # made by the same user holding tenant_admin (so the creator owns it), and
+    # everything inside runs with the ordinary creator roles, as in production.
+    # This passed for months only because a stale system_admin grant in the dev
+    # core made the creator break-glass (removed 2026-11-02).
+    with core_client.for_creator(cfg, created_by=USER, roles=list(roles) + ["tenant_admin"],
+                                 tenant=TENANT) as admin:
+        root_uid = admin.client.mkdir("", f"m1-fixture-{uuid.uuid4().hex[:8]}")
         if hasattr(root_uid, "uid"):
             root_uid = root_uid.uid
+    with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
+        c = core.client
         sub = c.mkdir(root_uid, "sub")
         sub = getattr(sub, "uid", sub)
         deep = c.mkdir(sub, "deep")

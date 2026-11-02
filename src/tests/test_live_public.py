@@ -66,9 +66,17 @@ def client(cfg) -> TestClient:
 
 @pytest.fixture
 def tree(cfg, roles):
+    # Creating at the tenant root is admin-only in the core, and share's creator
+    # roles are admin-stripped by design. The fixture's scratch root is therefore
+    # made by the same user holding tenant_admin (so the creator owns it), and
+    # everything inside runs with the ordinary creator roles, as in production.
+    # This passed for months only because a stale system_admin grant in the dev
+    # core made the creator break-glass (removed 2026-11-02).
+    with core_client.for_creator(cfg, created_by=USER, roles=list(roles) + ["tenant_admin"],
+                                 tenant=TENANT) as admin:
+        root = admin.client.mkdir("", f"m4-{uuid.uuid4().hex[:8]}"); root = getattr(root, "uid", root)
     with core_client.for_creator(cfg, created_by=USER, roles=roles, tenant=TENANT) as core:
         c = core.client
-        root = c.mkdir("", f"m4-{uuid.uuid4().hex[:8]}"); root = getattr(root, "uid", root)
         f = c.touch(root, "doc.txt"); f = getattr(f, "uid", f)
         c.put(f, b"the payload")
     return root, f

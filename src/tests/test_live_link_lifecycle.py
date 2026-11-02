@@ -102,18 +102,21 @@ def auth(cfg) -> dict:
 
 @pytest.fixture
 def root_dir(cfg) -> str:
-    """A folder in the dev core the fixture user can write to."""
+    """A folder in the dev core the fixture user owns, made for this run.
+
+    It used to take the first folder listed at the root — whatever that was. In
+    the dev core that is `admin_dir`, owned by another user, where the creator
+    can only read; writing there passed only while a stale system_admin grant
+    made the creator break-glass (removed 2026-11-02). Creating at the root is
+    admin-only, so the folder is made with tenant_admin added; the creator owns
+    it, and every test still acts with the ordinary (admin-stripped) roles.
+    """
     from share_service import core_client, ldap_roles
     roles = ldap_roles.resolve_share_roles(cfg, USER)
-    with core_client.for_creator(cfg, created_by=USER, roles=roles,
+    with core_client.for_creator(cfg, created_by=USER, roles=list(roles) + ["tenant_admin"],
                                  tenant=TENANT) as core:
-        entries = core.client.dir("")
-    # NB: DirectoryEntry exposes `is_container`; `is_dir` lives on FileInfo.
-    # Asking for the wrong one returns None and silently finds no folders.
-    for e in entries or []:
-        if getattr(e, "is_container", False):
-            return e.uid
-    pytest.skip("no directory available in the dev core")
+        made = core.client.mkdir("", f"links-{uuid.uuid4().hex[:8]}")
+    return getattr(made, "uid", made)
 
 
 def test_create_list_get_revoke(cfg, client, auth, root_dir):

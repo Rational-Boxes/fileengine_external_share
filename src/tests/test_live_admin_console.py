@@ -96,15 +96,21 @@ def conn(cfg):
 
 @pytest.fixture
 def real_folder(cfg) -> str:
-    """A folder that actually exists in the dev core, so the pre-flight passes."""
+    """A folder that actually exists in the dev core and ADMIN owns, so the
+    pre-flight passes and the fixture may write into it.
+
+    It used to take the first folder listed at the root, which in the dev core
+    belongs to another user; writing there passed only while a stale
+    system_admin grant made ADMIN break-glass (removed 2026-11-02). Root create
+    is admin-only, so the folder is made with tenant_admin added; ADMIN owns it
+    and the tests act with the ordinary (admin-stripped) roles.
+    """
     from share_service import core_client, ldap_roles
     roles = ldap_roles.resolve_share_roles(cfg, ADMIN)
-    with core_client.for_creator(cfg, created_by=ADMIN, roles=roles,
+    with core_client.for_creator(cfg, created_by=ADMIN, roles=list(roles) + ["tenant_admin"],
                                  tenant=TENANT) as core:
-        for e in core.client.dir("") or []:
-            if getattr(e, "is_container", False):
-                return e.uid
-    pytest.skip("no directory available in the dev core")
+        made = core.client.mkdir("", f"console-{uuid.uuid4().hex[:8]}")
+    return getattr(made, "uid", made)
 
 
 def _real_file(cfg, folder_uid: str) -> str:
