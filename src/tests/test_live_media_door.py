@@ -27,12 +27,20 @@ test_live_media_links.py.
 from __future__ import annotations
 
 import os
+import uuid
 import urllib.parse
 
 import pytest
 
 from tests.test_live_media_links import (BRIDGE, CSAI, ROOT, SHARE, TENANT, _SKIP, _clip,
                                          _login, _req, _wait)
+
+# Per-run addresses. The tenant is shared and audience rows outlive a run, so a
+# fixed address accumulated: the erasure below then removed every earlier run's
+# row too (27 at once) and "exactly one row" measured the tenant's history, not
+# this test.
+EXPECTED = f"expected-{uuid.uuid4().hex[:10]}@example.com"
+SECOND = f"second-{uuid.uuid4().hex[:10]}@example.com"
 
 pytestmark = [pytest.mark.live] + ([pytest.mark.skip(reason=_SKIP)] if _SKIP else [])
 
@@ -55,7 +63,7 @@ def v():
     assert code in (200, 201, 204)
     code, link = _req("POST", f"{SHARE}/share/v1/nodes/{uid}/links", headers=h,
                       body={"kind": 3, "access_mode": "claimed", "display_name": "Door test",
-                            "recipients": ["expected@example.com"]})
+                            "recipients": [EXPECTED]})
     assert code == 201, link
     ns = type("V", (), {})()
     ns.h, ns.uid, ns.link = h, uid, link["link_uid"]
@@ -98,7 +106,7 @@ def test_the_viewer_sees_what_the_player_needs_and_nothing_else(v):
 
 def test_claim_opens_a_session_and_the_bytes_match_the_published_rendition(v):
     code, s = _door(v, f"/claim?k={v.secret}", "POST",
-                    body={"email": "expected@example.com", "consent": True})
+                    body={"email": EXPECTED, "consent": True})
     assert code == 200, s
     v.session = s["session"]
     hd = next(x for x in s["sources"] if x["quality"] == "hd")
@@ -148,7 +156,7 @@ def test_a_beacon_is_merged_and_the_roster_reports_it(v):
     code, roster = _req("GET", f"{SHARE}/share/v1/links/{v.link}/audience", headers=v.h)
     assert code == 200, roster
     row = roster["audience"][0]
-    assert row["email"] == "expected@example.com"
+    assert row["email"] == EXPECTED
     assert row["verified"] is False and row["on_allowlist"] is True
     # 60 of the 99 counted buckets: the unplayed last bucket is not held against them
     assert row["coverage_pct"] == 61 and row["furthest_pct"] == 60
@@ -170,7 +178,7 @@ def test_the_sidecar_lands_beside_the_video_and_reads_back_through_the_bridge(v)
     assert body[:3] == b"\xef\xbb\xbf"
     rows = list(csv.DictReader(io.StringIO(body[3:].decode())))
     mine = [r for r in rows if r["link_uid"] == v.link]
-    assert mine and mine[0]["email"] == "expected@example.com"
+    assert mine and mine[0]["email"] == EXPECTED
     assert mine[0]["verified"] == "false" and mine[0]["coverage_pct"] == "61"
     v.sidecar_versions = len(_req("GET", f"{BRIDGE}/v1/files/{names['audience.csv']}/versions",
                                   headers=v.h)[1].get("versions", []))
@@ -181,20 +189,35 @@ def test_the_sidecar_lands_beside_the_video_and_reads_back_through_the_bridge(v)
     assert again == v.sidecar_versions
 
 
+ERASE_USER = os.environ.get("FE_ERASE_USER", "")
+ERASE_PASS = os.environ.get("FE_ERASE_PASS", "")
+
+
+@pytest.mark.skipif(not (ERASE_USER and ERASE_PASS),
+                    reason="set FE_ERASE_USER/FE_ERASE_PASS (a member of the tenant's "
+                           "erasure_admins group) for the audience erasure")
 def test_erasing_the_address_clears_it_from_the_sidecar_and_its_history(v):
     """Decided 2026-10-04: the core keeps one version of a hidden audience CSV,
     so regenerating after an erasure leaves the address in no version at all."""
     # One more change first, so audience.csv has more than one version to cull.
     code, _ = _req("POST", f"{SHARE}/media/v1/{v.link}/claim?k={v.secret}",
-                   body={"email": "second@example.com", "consent": True})
+                   body={"email": SECOND, "consent": True})
     assert code == 200
     _req("POST", f"{SHARE}/share/v1/links/{v.link}/audience/flush", headers=v.h)
     _c, kids = _req("GET", f"{BRIDGE}/v1/files/{v.uid}/renditions", headers=v.h)
     rollup = next(e["uid"] for e in kids["entries"] if e["name"] == "audience.csv")
     before = _req("GET", f"{BRIDGE}/v1/files/{rollup}/versions", headers=v.h)[1]["versions"]
     assert len(before) == 1                  # every write already retired the last
+    # Destroying data is gated to erasure_admins (2026-10-20): the fixture's
+    # tenant admin is refused, and the erasure is done by a member of that
+    # group. This test ran as the tenant admin and only passed while a stale
+    # system_admin grant made that admin break-glass in the dev core.
     code, out = _req("POST", f"{SHARE}/share/v1/admin/audience/erase", headers=v.h,
-                     body={"email": "expected@example.com"})
+                     body={"email": EXPECTED})
+    assert code == 403, f"a plain tenant admin must not erase: {code} {out}"
+    eh = {"Authorization": f"Bearer {_login(ERASE_USER, ERASE_PASS)}", "X-Tenant": TENANT}
+    code, out = _req("POST", f"{SHARE}/share/v1/admin/audience/erase", headers=eh,
+                     body={"email": EXPECTED})
     assert code == 200, out
     assert out["rows"] == 1
     rep = out["reports"][0]
@@ -203,7 +226,7 @@ def test_erasing_the_address_clears_it_from_the_sidecar_and_its_history(v):
     after = _req("GET", f"{BRIDGE}/v1/files/{rollup}/versions", headers=v.h)[1]["versions"]
     assert len(after) == 1
     _c, body = _req("GET", f"{BRIDGE}/v1/files/{rollup}/content", headers=v.h)
-    assert b"expected@example.com" not in body and b"second@example.com" in body
+    assert EXPECTED.encode() not in body and SECOND.encode() in body
 
 
 def test_revoking_the_link_stops_the_viewing_on_the_next_request(v):

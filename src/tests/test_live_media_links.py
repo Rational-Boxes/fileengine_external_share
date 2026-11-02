@@ -80,8 +80,8 @@ def _req(method, url, *, headers=None, body=None, raw=None, timeout=60):
             return e.code, text
 
 
-def _login() -> str:
-    basic = base64.b64encode(f"{USER}:{PASS}".encode()).decode()
+def _login(user: str = "", password: str = "") -> str:
+    basic = base64.b64encode(f"{user or USER}:{password or PASS}".encode()).decode()
     code, body = _req("POST", f"{BRIDGE}/v1/auth/token",
                       headers={"Authorization": f"Basic {basic}", "X-Tenant": TENANT})
     if isinstance(body, dict) and body.get("token"):
