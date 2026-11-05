@@ -113,7 +113,7 @@ def _ddl(schema: str) -> list[str]:
             secret_hash     BYTEA        NOT NULL,
             created_by      TEXT         NOT NULL,
             created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
-            expires_at      TIMESTAMPTZ  NOT NULL,
+            expires_at      TIMESTAMPTZ,  -- NULL = no expiry (SHARE_ALLOW_NO_EXPIRY)
             revoked_at      TIMESTAMPTZ,
             revoked_by      TEXT,
             -- Budgets. 0 = unlimited, subject to the deployment cap (spec §9).
@@ -234,6 +234,9 @@ def _ddl(schema: str) -> list[str]:
         # link (a client receiving a deliverable usually wants the file), false
         # otherwise (a public video need not advertise a direct file URL).
         f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS allow_download BOOLEAN NOT NULL DEFAULT false;",
+        # "No expiry" links store NULL. Idempotent: DROP NOT NULL on a nullable
+        # column is a no-op, so schemas created before this self-heal.
+        f"ALTER TABLE {s}.share_links ALTER COLUMN expires_at DROP NOT NULL;",
 
         # --- share_link_audience (MEDIA_SHARE.md §7.1) ----------------------
         # NOT share_link_recipients. That table is an ALLOWLIST written by an

@@ -202,6 +202,10 @@ class Config:
         )
 
         self.max_ttl_days = _int("SHARE_MAX_TTL_DAYS", 30)
+        # Whether a creator may choose "No expiry". The link is still bounded by
+        # its use/byte budget, its recipient list, revocation, and the creator's
+        # own live access (redemptions run as the creator).
+        self.allow_no_expiry = _bool("SHARE_ALLOW_NO_EXPIRY", True)
         # A redemption session, not an HTTP request, is what consumes a use
         # (spec §6.4) -- so this is how long Range continuations and retries
         # may keep riding one redemption_uid.

@@ -64,15 +64,18 @@ def sweep_tenant(config: Config, tenant: str, *, limit: int = 500) -> dict:
     try:
         with conn.cursor() as cur:
             # Eligible = definitively dead AND older than the window. `expires_at`
-            # is the clock for both cases: a revoked link still has one, and it
-            # is always <= the moment it was minted plus the deployment cap.
+            # is the clock for both cases: a revoked link usually still has one,
+            # and it is always <= the moment it was minted plus the deployment
+            # cap. A "no expiry" link has none, so once revoked its clock is the
+            # revocation; unrevoked, it is never eligible.
             cur.execute(
                 """SELECT link_uid, kind, resource_uid, created_by, expires_at,
                           revoked_at, uses_consumed
                      FROM share_links
                     WHERE (revoked_at IS NOT NULL OR expires_at < now())
-                      AND expires_at < now() - make_interval(days => %s)
-                    ORDER BY expires_at ASC
+                      AND COALESCE(expires_at, revoked_at)
+                          < now() - make_interval(days => %s)
+                    ORDER BY COALESCE(expires_at, revoked_at) ASC
                     LIMIT %s""",
                 (config.retention_days, limit))
             candidates = cur.fetchall()

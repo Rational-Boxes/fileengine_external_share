@@ -250,7 +250,7 @@ CREATE TABLE IF NOT EXISTS "<tenant>".share_links (
     secret_hash     BYTEA        NOT NULL,   -- sha256(secret); never the secret
     created_by      TEXT         NOT NULL,   -- the delegating principal
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    expires_at      TIMESTAMPTZ  NOT NULL,   -- hard requirement; no perpetual links
+    expires_at      TIMESTAMPTZ,             -- NULL = no expiry (§13-R14)
     revoked_at      TIMESTAMPTZ,
     revoked_by      TEXT,
     -- budgets (0 = unlimited, subject to the deployment cap in §9)
@@ -476,7 +476,8 @@ enforcement.
 - the target's type matches the kind — file for `0`, directory for `1` and `2`
   (mismatch ⇒ `400`), established from `Stat` as the caller, **and**
 - at least one recipient address, capped at `share.max_recipients` (§6.9), **and**
-- `expires_at` within the deployment's `share.max_ttl_days` cap (§9), **and**
+- `expires_at` within the deployment's `share.max_ttl_days` cap (§9) — or
+  `no_expiry: true`, if `share.allow_no_expiry` permits it (§13-R14) — **and**
 - for `kind = 2`: the snapshot walk succeeds within
   `share.zip_max_members` / `share.zip_max_bytes` (§9). Creation is where an
   oversized folder is refused — with a clear count/size in the error — so the
@@ -1370,6 +1371,7 @@ feature (§4).
 | `share.ldap_group` | `share_external` | The group whose members may mint links (§8.1). |
 | `share.max_body_bytes` | `100 MiB` | Request-body cap on the public prefix. Replaces the bridge's `max_body_bytes`, which no longer sits in front of this traffic. |
 | `share.max_ttl_days` | `30` | Cap on `expires_at`; the UI cannot offer longer. |
+| `share.allow_no_expiry` | `true` | Whether a creator may choose **No expiry** (`no_expiry: true`, stored as a NULL `expires_at`). Advertised in `/capabilities` as `expiry.no_expiry`; the UI offers the choice only when it is. (§13-R14) |
 | `share.max_uses_cap` | `100` | Cap on `max_uses`; `0` (unlimited) is only accepted if this is `0`. |
 | `share.default_ttl_days` | `7` | Pre-filled in the UI. |
 | `share.session_ttl_seconds` | `3600` | Redemption-session lifetime (§6.4). |
@@ -1476,7 +1478,7 @@ Each link in the list shows one computed state, not a pile of raw fields:
 |---|---|
 | **Active** | Redeemable right now. Shows the expiry countdown and `3 / 5 used`. |
 | **Exhausted** | Use budget spent. Distinct from expired — the fix is a new link, not a longer one. |
-| **Expired** | Past `expires_at`. |
+| **Expired** | Past `expires_at`. A link with no expiry never reaches this state. |
 | **Revoked** | Revoked by *(who, when)*. |
 | **Blocked** | `locked_until` is live after repeated bad secrets or codes (§8.4) — someone is probing it. |
 | **⚠ Not working — you no longer have access** | The §6.3 re-check now fails for the creator. |
@@ -2092,6 +2094,20 @@ inconsistencies rather than open questions, and all four are now fixed in place:
 - **`share_link_expired` is fail-closed.** It records the destruction of audit
   evidence, so a purge that cannot be recorded does not happen — which is also
   what `is_fail_closed(Admin)` already does.
+
+**R14 — "No expiry" links: allowed, behind a deployment switch.** *(Reverses the
+"no perpetual links" rule of §5.1, 2026-11-05, at the owner's request.)* A
+creator may choose **No expiry**; the link is stored with a NULL `expires_at`
+and every liveness predicate reads NULL as "not expired". Nothing else is
+relaxed: the use/byte budget, the recipient list, revocation, lockout and — the
+real bound — the creator's own live access, since every redemption runs as the
+creator (R13), all still apply. `SHARE_ALLOW_NO_EXPIRY` (default on) turns the
+choice off; asking for it together with `expires_at`/`ttl_days` is a 400 rather
+than a silent pick. Retention ages a revoked no-expiry link from `revoked_at`;
+an unrevoked one is never eligible. The UI offers the choice only when
+`/capabilities` advertises `expiry.no_expiry`, because an older service ignores
+the field and would mint a default-TTL link while the creator believed it
+permanent.
 
 ---
 

@@ -95,3 +95,13 @@ def test_revoked_wins_over_a_lockout():
     l = link(revoked_at=NOW(), locked_until=NOW() + timedelta(minutes=15))
     assert l.status() == "revoked"
     assert l.is_dead is True
+
+
+def test_a_link_with_no_expiry_never_expires():
+    l = link(expires_at=None)
+    assert l.is_expired is False
+    assert l.status() == "active"
+    assert l.is_dead is False
+    # Every other way to die still applies.
+    assert link(expires_at=None, max_uses=1, uses_consumed=1).status() == "exhausted"
+    assert link(expires_at=None, revoked_at=NOW()).status() == "revoked"

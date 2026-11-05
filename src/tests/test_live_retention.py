@@ -104,6 +104,28 @@ def test_a_revoked_link_ages_out_like_any_other(cfg, conn):
     assert not _exists(conn, revoked.link_uid)
 
 
+def test_a_no_expiry_link_ages_out_from_its_revocation(cfg, conn):
+    """A "no expiry" link has no expires_at to age by: unrevoked it is kept
+    forever, revoked its clock is the revocation."""
+    def mint():
+        made, _ = links.create(
+            conn, kind=0, resource_uid=str(uuid.uuid4()), created_by=USER,
+            expires_at=None, recipients=["forever@example.com"], max_uses=1)
+        return made
+    live, old, recent = mint(), mint(), mint()
+    with conn.cursor() as cur:
+        cur.execute("""UPDATE share_links
+                          SET revoked_at = now() - make_interval(days => %s)
+                        WHERE link_uid = %s""", (cfg.retention_days + 5, old.link_uid))
+        cur.execute("UPDATE share_links SET revoked_at = now() WHERE link_uid = %s",
+                    (recent.link_uid,))
+    conn.commit()
+    retention.sweep_tenant(cfg, TENANT)
+    assert _exists(conn, live.link_uid)
+    assert _exists(conn, recent.link_uid)
+    assert not _exists(conn, old.link_uid)
+
+
 def test_the_recipient_addresses_go_with_it(cfg, conn):
     """The actual point of the window. Everything else here is disk."""
     old = _aged_link(cfg, conn, days_dead=cfg.retention_days + 5,
