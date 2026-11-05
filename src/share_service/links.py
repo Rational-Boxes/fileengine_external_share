@@ -87,7 +87,9 @@ class Link:
     resource_uid: str
     created_by: str
     created_at: datetime
-    expires_at: datetime
+    # None = never expires: the creator chose "No expiry" and the deployment
+    # allows it (SHARE_ALLOW_NO_EXPIRY). Every other limit still binds.
+    expires_at: Optional[datetime]
     revoked_at: Optional[datetime] = None
     revoked_by: Optional[str] = None
     max_uses: int = 0
@@ -130,7 +132,8 @@ class Link:
 
     @property
     def is_expired(self) -> bool:
-        return self.expires_at <= datetime.now(timezone.utc)
+        return (self.expires_at is not None
+                and self.expires_at <= datetime.now(timezone.utc))
 
     @property
     def is_exhausted(self) -> bool:
@@ -203,7 +206,7 @@ def _row_to_link(row: tuple) -> Link:
 # --- writes --------------------------------------------------------------
 
 def create(conn, *, kind: int, resource_uid: str, created_by: str,
-           expires_at: datetime, recipients: Iterable[str],
+           expires_at: Optional[datetime], recipients: Iterable[str],
            secret: Optional[str] = None, tenant: str = "",
            **budgets: Any) -> tuple[Link, str]:
     """Insert a link and its recipient allowlist. Returns (link, plaintext secret).
@@ -323,7 +326,7 @@ def live_media_links(conn, resource_uid: str) -> List[Link]:
     with conn.cursor() as cur:
         cur.execute(f"""SELECT {_COLUMNS} FROM share_links
                          WHERE resource_uid = %s AND kind = %s
-                           AND revoked_at IS NULL AND expires_at > now()
+                           AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                          ORDER BY created_at""", (resource_uid, KIND_MEDIA))
         found = [_row_to_link(r) for r in cur.fetchall()]
     return [l for l in found if not l.is_dead]
@@ -386,7 +389,7 @@ def list_for_resource(conn, resource_uid: str) -> List[Link]:
 def list_for_creator(conn, created_by: str, live_only: bool = True) -> List[Link]:
     sql = f"SELECT {_COLUMNS} FROM share_links WHERE created_by = %s"
     if live_only:
-        sql += " AND revoked_at IS NULL AND expires_at > now()"
+        sql += " AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())"
     sql += " ORDER BY created_at DESC"
     with conn.cursor() as cur:
         cur.execute(sql, (created_by,))
@@ -399,13 +402,13 @@ def list_for_creator(conn, created_by: str, live_only: bool = True) -> List[Link
 # step — the property the Python-only filter was protecting.
 _STATUS_SQL = {
     "revoked": "l.revoked_at IS NOT NULL",
-    "expired": "l.revoked_at IS NULL AND l.expires_at <= now()",
-    "blocked": ("l.revoked_at IS NULL AND l.expires_at > now() "
+    "expired": "l.revoked_at IS NULL AND l.expires_at IS NOT NULL AND l.expires_at <= now()",
+    "blocked": ("l.revoked_at IS NULL AND (l.expires_at IS NULL OR l.expires_at > now()) "
                 "AND l.locked_until IS NOT NULL AND l.locked_until > now()"),
-    "exhausted": ("l.revoked_at IS NULL AND l.expires_at > now() "
+    "exhausted": ("l.revoked_at IS NULL AND (l.expires_at IS NULL OR l.expires_at > now()) "
                   "AND (l.locked_until IS NULL OR l.locked_until <= now()) "
                   "AND l.max_uses > 0 AND l.uses_consumed >= l.max_uses"),
-    "active": ("l.revoked_at IS NULL AND l.expires_at > now() "
+    "active": ("l.revoked_at IS NULL AND (l.expires_at IS NULL OR l.expires_at > now()) "
                "AND (l.locked_until IS NULL OR l.locked_until <= now()) "
                "AND NOT (l.max_uses > 0 AND l.uses_consumed >= l.max_uses)"),
 }
@@ -429,7 +432,7 @@ def list_for_tenant(conn, *, live_only: bool = True, creator: str = "",
     where = ["1=1"]
     params: List[Any] = []
     if live_only:
-        where.append("l.revoked_at IS NULL AND l.expires_at > now()")
+        where.append("l.revoked_at IS NULL AND (l.expires_at IS NULL OR l.expires_at > now())")
     if status:
         # In the WHERE clause, BEFORE the row cap. Filtering after it (as this
         # did) looked for revoked links only among the 500 riskiest rows —
@@ -685,7 +688,7 @@ def revoke_all_for_creator(conn, created_by: str,
         cur.execute(
             """UPDATE share_links SET revoked_at = now(), revoked_by = %s
                 WHERE lower(created_by) = lower(%s)
-                  AND revoked_at IS NULL AND expires_at > now()
+                  AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())
              RETURNING link_uid, resource_uid""",
             (revoked_by, created_by))
         rows = [(str(r[0]), str(r[1]) if r[1] else "") for r in cur.fetchall()]
@@ -799,9 +802,19 @@ def normalize_email(raw: str) -> str:
 
 
 def clamp_expiry(cfg: Config, requested: Optional[datetime],
-                 ttl_days: Optional[int]) -> datetime:
-    """Resolve and cap the expiry (spec §9). No perpetual links: an absent
-    request gets the default TTL, and nothing may exceed the deployment cap."""
+                 ttl_days: Optional[int], no_expiry: bool = False) -> Optional[datetime]:
+    """Resolve and cap the expiry (spec §9). An absent request gets the default
+    TTL, and nothing may exceed the deployment cap.
+
+    ``no_expiry`` asks for a perpetual link and returns None. It is refused
+    unless the deployment allows it, and refused alongside an explicit expiry
+    rather than silently picking one of the two."""
+    if no_expiry:
+        if not cfg.allow_no_expiry:
+            raise ValueError("links without an expiry are not allowed on this deployment")
+        if requested is not None or ttl_days is not None:
+            raise ValueError("no_expiry cannot be combined with expires_at or ttl_days")
+        return None
     now = datetime.now(timezone.utc)
     cap = now + timedelta(days=cfg.max_ttl_days)
     if requested is not None:

@@ -209,6 +209,25 @@ def test_expiry_is_capped_at_the_deployment_maximum(cfg, client, auth, root_dir)
     assert expires <= datetime.now(timezone.utc) + timedelta(days=cfg.max_ttl_days, seconds=60)
 
 
+def test_a_link_can_be_created_with_no_expiry(cfg, client, auth, root_dir):
+    if not cfg.allow_no_expiry:
+        pytest.skip("SHARE_ALLOW_NO_EXPIRY is off on this deployment")
+    r = client.post(f"/share/v1/nodes/{root_dir}/links",
+                    json={"kind": 2, "recipients": ["a@example.com"],
+                          "no_expiry": True, "max_uses": 1},
+                    headers=auth)
+    assert r.status_code == 201, r.text
+    assert r.json()["expires_at"] is None
+    assert r.json()["status"] == "active"
+    listed = client.get("/share/v1/links", headers=auth).json()["links"]
+    assert r.json()["link_uid"] in {l["link_uid"] for l in listed}
+    r2 = client.post(f"/share/v1/nodes/{root_dir}/links",
+                     json={"kind": 2, "recipients": ["a@example.com"],
+                           "no_expiry": True, "ttl_days": 3, "max_uses": 1},
+                     headers=auth)
+    assert r2.status_code == 400
+
+
 def test_recipients_are_required_and_bounded(cfg, client, auth, root_dir):
     r = client.post(f"/share/v1/nodes/{root_dir}/links",
                     json={"kind": 2, "recipients": [], "max_uses": 1}, headers=auth)

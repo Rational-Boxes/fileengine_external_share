@@ -130,7 +130,7 @@ def reserve_slot(conn, link_uid: str) -> bool:
             """UPDATE share_links
                   SET files_consumed = files_consumed + 1
                 WHERE link_uid = %s
-                  AND revoked_at IS NULL AND expires_at > now()
+                  AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                   AND (max_files = 0 OR files_consumed < max_files)""",
             (link_uid,))
         took = cur.rowcount > 0

@@ -62,6 +62,9 @@ class CreateLinkRequest(BaseModel):
     recipients: List[str] = Field(default_factory=list)
     expires_at: Optional[datetime] = None
     ttl_days: Optional[int] = None
+    # A perpetual link: refused unless the deployment allows it
+    # (SHARE_ALLOW_NO_EXPIRY), and refused alongside expires_at/ttl_days.
+    no_expiry: bool = False
     max_uses: int = 0
     max_uses_per_recipient: int = 0
     max_bytes: int = 0
@@ -333,6 +336,9 @@ def capabilities(request: Request, caller: Caller = Depends(get_caller)) -> dict
     which the create call checks and explains."""
     cfg = _config(request)
     return {"enabled": bool(cfg.enabled),
+            "expiry": {"no_expiry": bool(cfg.allow_no_expiry),
+                       "max_ttl_days": cfg.max_ttl_days,
+                       "default_ttl_days": cfg.default_ttl_days},
             "media": {"available": bool(cfg.enabled and cfg.media_enabled),
                       "open_mode": bool(cfg.allow_open_mode),
                       "playback_tracking": bool(cfg.playback_tracking),
@@ -407,7 +413,8 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
                             f"at most {cfg.max_recipients} recipients")
     try:
-        expires_at = links.clamp_expiry(cfg, body.expires_at, body.ttl_days)
+        expires_at = links.clamp_expiry(cfg, body.expires_at, body.ttl_days,
+                                         body.no_expiry)
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
 
@@ -555,7 +562,7 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
                 actor=caller.user, tenant=caller.tenant, target_uid=resource_uid,
                 source_addr=caller.source_addr, request_id=link.link_uid,
                 detail={"link_uid": link.link_uid, "kind": link.kind,
-                        "recipients": len(emails), "expires_at": expires_at.isoformat(),
+                        "recipients": len(emails), "expires_at": expires_at.isoformat() if expires_at else None,
                         "max_uses": link.max_uses, "access_mode": link.access_mode,
                         **({"media_state": link.media_state,
                             "embed_origins": len(link.allowed_embed_origins or []),

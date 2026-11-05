@@ -84,9 +84,14 @@ def creator() -> str:
     return f"console-{uuid.uuid4().hex[:10]}@example.com"
 
 
-def _mint(conn, creator, **budgets) -> str:
+_DEFAULT = object()
+
+
+def _mint(conn, creator, expires_at=_DEFAULT, **budgets) -> str:
+    if expires_at is _DEFAULT:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     link, _ = links.create(conn, kind=0, resource_uid=str(uuid.uuid4()), created_by=creator,
-                           expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+                           expires_at=expires_at,
                            recipients=["r@example.com"], tenant=TENANT, **budgets)
     return link.link_uid
 
@@ -141,7 +146,14 @@ def test_status_sql_matches_link_status(conn, creator):
         "revoked_and_expired": _mint(conn, creator),
         "blocked_and_exhausted": _mint(conn, creator, max_uses=1),
         "lock_lifted": _mint(conn, creator),
+        # A "no expiry" link (NULL expires_at) is live in every predicate, and
+        # dies only by revocation or budget.
+        "no_expiry": _mint(conn, creator, expires_at=None),
+        "no_expiry_revoked": _mint(conn, creator, expires_at=None),
+        "no_expiry_exhausted": _mint(conn, creator, expires_at=None, max_uses=1),
     }
+    links.revoke(conn, made["no_expiry_revoked"], ADMIN)
+    _set(conn, made["no_expiry_exhausted"], "uses_consumed = 1")
     links.revoke(conn, made["revoked"], ADMIN)
     links.revoke(conn, made["revoked_and_expired"], ADMIN)
     _set(conn, made["expired"], "expires_at = now() - interval '1 minute'")
