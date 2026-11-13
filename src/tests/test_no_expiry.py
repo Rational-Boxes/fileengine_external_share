@@ -21,7 +21,9 @@ expiry is an error rather than a silent pick of one of the two.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -56,3 +58,22 @@ def test_no_expiry_with_an_explicit_expiry_is_refused(cfg):
 def test_without_no_expiry_the_cap_still_binds(cfg):
     got = links.clamp_expiry(cfg, None, cfg.max_ttl_days + 90)
     assert got <= datetime.now(timezone.utc) + timedelta(days=cfg.max_ttl_days, seconds=5)
+
+
+def test_no_sql_reads_a_null_link_expiry_as_expired():
+    """A bare `expires_at > now()` is NULL for a no-expiry link, i.e. false.
+    One in the session open made every no-expiry link unredeemable while every
+    other path reported it active. Session/audience tables keep a NOT NULL
+    expiry, so the check is confined to statements that touch share_links."""
+    src = Path(links.__file__).parent
+    bare = re.compile(r"(?<![\w.])(?:l\.)?expires_at\s*>\s*now\(\)")
+    guarded = re.compile(r"expires_at IS NULL OR (?:l\.)?expires_at\s*>\s*now\(\)")
+    offenders = []
+    for f in sorted(src.glob("*.py")):
+        text = f.read_text()
+        for stmt in re.findall(r'"""(.*?)"""', text, re.S):
+            if "share_links" not in stmt:
+                continue
+            if len(bare.findall(stmt)) > len(guarded.findall(stmt)):
+                offenders.append(f"{f.name}: {' '.join(stmt.split())[:120]}")
+    assert offenders == []

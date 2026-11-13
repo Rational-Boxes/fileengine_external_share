@@ -228,6 +228,32 @@ def test_a_link_can_be_created_with_no_expiry(cfg, client, auth, root_dir):
     assert r2.status_code == 400
 
 
+def test_a_link_with_no_expiry_can_be_redeemed(cfg, client, auth, root_dir):
+    """Creating one is not enough: the session open consumes a use under its
+    own liveness predicate, which once read a NULL expiry as expired. The
+    recipient verified, the session 404'd, and the page fell back to asking
+    for their address again."""
+    if not cfg.allow_no_expiry:
+        pytest.skip("SHARE_ALLOW_NO_EXPIRY is off on this deployment")
+    r = client.post(f"/share/v1/nodes/{root_dir}/links",
+                    json={"kind": 2, "recipients": [RECIPIENT_A],
+                          "no_expiry": True, "max_uses": 2},
+                    headers=auth)
+    assert r.status_code == 201, r.text
+    link_uid = r.json()["link_uid"]
+
+    from share_service import sessions, ldap_roles
+    conn = db.connect_for_tenant(cfg, TENANT, provision=True)
+    try:
+        roles = ldap_roles.resolve_share_roles(cfg, USER)
+        s = sessions.open_session(conn, cfg, link_uid=link_uid,
+                                  verified_email=RECIPIENT_A, tenant=TENANT,
+                                  roles=roles)
+    finally:
+        conn.close()
+    assert s.redemption_uid
+
+
 def test_recipients_are_required_and_bounded(cfg, client, auth, root_dir):
     r = client.post(f"/share/v1/nodes/{root_dir}/links",
                     json={"kind": 2, "recipients": [], "max_uses": 1}, headers=auth)

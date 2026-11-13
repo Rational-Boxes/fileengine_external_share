@@ -94,7 +94,7 @@ def _consume_use(conn, link_uid: str, email: str) -> Optional[dict]:
                   FROM share_links
                  WHERE link_uid = %(link)s
                    AND revoked_at IS NULL
-                   AND expires_at > now()
+                   AND (expires_at IS NULL OR expires_at > now())
                    AND (locked_until IS NULL OR locked_until < now())
                    FOR UPDATE
             ), rcpt AS (
