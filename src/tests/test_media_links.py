@@ -608,6 +608,45 @@ def test_media_links_are_player_only_by_default(world, conn):
     assert _create(world, access_mode="claimed", allow_download=True).json()["allow_download"] is True
 
 
+@pytest.mark.parametrize("url", [
+    "javascript:alert(1)", "data:text/html,<b>x</b>", "ftp://example.com/x",
+    "https://user:pass@example.com/", "https://example.com/a b", "example.com",
+    "https://", "https://example.com:99999/", "https://example.com/\nx",
+    "https://" + "a" * 2050 + ".com",
+])
+def test_a_follow_link_must_be_a_plain_http_address(world, url):
+    r = _create(world, follow_link_url=url, follow_link_title="More")
+    assert r.status_code == 400 and r.json()["detail"]["error"] == "follow_link_invalid", r.text
+
+
+def test_a_video_can_sign_off_with_a_titled_link(world, conn):
+    r = _create(world, follow_link_url=" https://www.example.com/more?x=1#top ",
+                follow_link_title="  Read the\nfull  report ")
+    assert r.status_code == 201, r.text
+    b = r.json()
+    assert b["follow_link_url"] == "https://www.example.com/more?x=1#top"
+    assert b["follow_link_title"] == "Read the full report"         # one line, trimmed
+    listed = world.client.get(f"/share/v1/links/{b['link_uid']}", headers=world.auth).json()
+    assert listed["follow_link_url"] == b["follow_link_url"]
+    # Untitled: the host stands in. Absent: nothing at all.
+    assert _create(world, follow_link_url="http://example.org/x").json()["follow_link_title"] == "example.org"
+    none = _create(world).json()
+    assert none["follow_link_url"] is None and none["follow_link_title"] is None
+
+
+def test_a_follow_link_title_needs_an_address_and_is_bounded(world):
+    assert _create(world, follow_link_title="More").status_code == 400
+    assert _create(world, follow_link_url="https://example.com",
+                   follow_link_title="x" * 121).status_code == 400
+
+
+def test_only_a_media_link_takes_a_follow_link(world):
+    r = world.client.post(f"/share/v1/nodes/{uuid.uuid4()}/links", headers=world.auth,
+                          json={"kind": 0, "recipients": ["a@example.com"],
+                                "follow_link_url": "https://example.com"})
+    assert r.status_code == 400
+
+
 def test_embed_anywhere_is_for_open_links_only(world, cfg, conn):
     assert _create(world, access_mode="claimed", allowed_embed_origins=["*"]).status_code == 400
     r = _create(world, access_mode="open", recipients=[], confirm_public=True,

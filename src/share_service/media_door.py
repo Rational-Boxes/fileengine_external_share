@@ -727,6 +727,11 @@ def _open(cfg: Config, request: Request, tenant: str, conn, link, *, mode: str,
     return _json({"session": token, "expires_at": expires, "title": link.display_name,
                   "duration_ms": link.duration_ms, "sources": sources,
                   "tracking": bool(cfg.playback_tracking),
+                  # The creator's sign-off link, given with the video and not
+                  # before: on a gated link it is part of what the gate guards.
+                  **({"follow_link": {"url": link.follow_link_url,
+                                      "title": link.follow_link_title or link.follow_link_url}}
+                     if link.follow_link_url else {}),
                   **({"beacon": f"{router.prefix}/{link.link_uid}/playback?t={token}"}
                      if cfg.playback_tracking else {})},
                  headers=cors)

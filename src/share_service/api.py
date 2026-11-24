@@ -90,6 +90,10 @@ class CreateLinkRequest(BaseModel):
     # May viewers save a copy? Unset = no, in every mode: a media link is the
     # player only (owner's decision 2026-10-04). A caller can still ask for it.
     allow_download: Optional[bool] = None
+    # An optional sign-off shown under the player, opened in a new tab: "for
+    # more information, see <title>". Media links only.
+    follow_link_url: Optional[str] = None
+    follow_link_title: Optional[str] = None
 
 
 #: What the creator of an open link is shown and must acknowledge (§5 rule 4).
@@ -132,6 +136,47 @@ def _embed_origins(raw: Optional[List[str]], *, mode: str = ACCESS_VERIFIED,
     return out
 
 
+FOLLOW_LINK_URL_MAX = 2048
+FOLLOW_LINK_TITLE_MAX = 120
+
+
+def _follow_link(url: Optional[str], title: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """(url, title), validated, for a media link's sign-off link.
+
+    The URL is put in front of every viewer as a link from the tenant's own
+    page, so only a plain http(s) address is accepted: no javascript:/data:
+    (script in the page's origin), no user:pass@ (the classic disguise), no
+    whitespace or control characters. The title is text (Vue and the player
+    escape it); it defaults to the URL's host when left empty."""
+    from urllib.parse import urlsplit
+    url = (url or "").strip()
+    title = " ".join((title or "").split())   # control chars, newlines -> single spaces
+    if not url:
+        if title:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                                {"error": "follow_link_invalid",
+                                 "message": "a link title needs a link address"})
+        return None, None
+    bad = HTTPException(status.HTTP_400_BAD_REQUEST,
+                        {"error": "follow_link_invalid",
+                         "message": "the link must be a full http:// or https:// address"})
+    if len(url) > FOLLOW_LINK_URL_MAX or any(c.isspace() or ord(c) < 0x20 or ord(c) == 0x7F for c in url):
+        raise bad
+    try:
+        u = urlsplit(url)
+        host = u.hostname
+        u.port   # raises on a malformed port
+    except ValueError:
+        raise bad
+    if u.scheme.lower() not in ("http", "https") or not host or "@" in u.netloc:
+        raise bad
+    if len(title) > FOLLOW_LINK_TITLE_MAX:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            {"error": "follow_link_invalid",
+                             "message": f"the link title is limited to {FOLLOW_LINK_TITLE_MAX} characters"})
+    return url, (title or host)
+
+
 class AddRecipientRequest(BaseModel):
     email: str
 
@@ -167,7 +212,9 @@ def _link_json(link: links.Link, *, status_override: Optional[str] = None) -> di
             "display_name": link.display_name, "media_state": link.media_state,
             "media_version": link.media_version, "duration_ms": link.duration_ms,
             "output_bytes": link.output_bytes, "poster_uid": link.poster_uid,
-            "allow_download": link.allow_download}
+            "allow_download": link.allow_download,
+            "follow_link_url": link.follow_link_url,
+            "follow_link_title": link.follow_link_title}
            if link.kind == KIND_MEDIA else {}),
     }
 
@@ -431,6 +478,11 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
     # whatever the internal naming says — "ACME-Q3-teardown-CONFIDENTIAL-v4" —
     # so an OPEN link must be given one; the others default below.
     display_name = (body.display_name or "").strip()[:200] or None
+    if not is_media and (body.follow_link_url or body.follow_link_title):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST,
+                            "follow_link_url is for a media link (kind 3)")
+    follow_url, follow_title = (_follow_link(body.follow_link_url, body.follow_link_title)
+                                if is_media else (None, None))
     if is_media and mode == ACCESS_OPEN and not display_name:
         raise HTTPException(status.HTTP_400_BAD_REQUEST,
                             {"error": "display_name_required",
@@ -548,6 +600,7 @@ def create_link(resource_uid: str, body: CreateLinkRequest, request: Request,
                 "display_name": display_name,
                 "poster_uid": poster_uid,
                 "allow_download": bool(body.allow_download),
+                "follow_link_url": follow_url, "follow_link_title": follow_title,
                 **media_fields} if is_media else {}))
 
         if snap is not None:
