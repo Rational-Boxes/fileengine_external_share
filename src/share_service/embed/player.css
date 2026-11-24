@@ -15,6 +15,6 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); f
 .fp-poster { position: relative; }
 .fp-poster img { width: 100%; display: block; border-radius: 4px; }
 .fp-poster button { position: absolute; inset: 0; margin: auto; width: 3.6rem; height: 3.6rem; border-radius: 50%; background: rgba(0,0,0,.6); font-size: 1.4rem; }
-.fp-follow { margin: 0; }
+.fp-follow { margin: 0; text-align: center; }
 .fp-follow a { color: var(--primary); font-weight: 600; text-decoration: none; }
 .fp-follow a:hover { text-decoration: underline; }
