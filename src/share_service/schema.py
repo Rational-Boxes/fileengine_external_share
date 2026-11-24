@@ -183,6 +183,10 @@ def _ddl(schema: str) -> list[str]:
         f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS allowed_embed_origins TEXT[];",
         # What the landing page and the embed title the video (§9.2).
         f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS display_name TEXT;",
+        # An optional sign-off under the player: "for more, see <title>" (an
+        # http(s) URL, opened in a new tab). Validated in api.py.
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS follow_link_url TEXT;",
+        f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS follow_link_title TEXT;",
         f"ALTER TABLE {s}.share_links ADD COLUMN IF NOT EXISTS media_state TEXT;",
         # Stored so /peek and the embed answer without touching the core (§6.2
         # rule 4). Describe the newest published set this service has heard of.

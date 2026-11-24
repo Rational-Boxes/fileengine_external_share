@@ -289,7 +289,9 @@ def run_due(cfg: Config, tenants: Iterable[str], **kw) -> List[dict]:
     out = []
     for tenant in tenants:
         try:
-            conn = db.connect_for_tenant(cfg, tenant)
+            # provision: the projection reads share_links, whose columns a new
+            # release may have added since this process last saw the tenant.
+            conn = db.connect_for_tenant(cfg, tenant, provision=True)
         except Exception:  # noqa: BLE001
             continue
         try:

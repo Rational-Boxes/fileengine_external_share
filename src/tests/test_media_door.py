@@ -735,6 +735,18 @@ def test_peek_says_whether_download_is_allowed(w):
     assert w.client.get(f"/media/v1/{link}?k={secret}").json()["allow_download"] is True
 
 
+def test_the_follow_link_comes_with_the_video_not_before_it(w):
+    link, secret = _mint(w, "verified", recipients=["v@example.com"],
+                         follow_link_url="https://example.com/more", follow_link_title="More")
+    peek = w.client.get(f"/media/v1/{link}?k={secret}").json()
+    assert "follow" not in str(peek)                 # the gate guards it
+    s = w.client.post(f"/media/v1/{link}/session?k={secret}", json={"email": "v@example.com"},
+                      headers={"X-Recipient-Token": "good-token"}).json()
+    assert s["follow_link"] == {"url": "https://example.com/more", "title": "More"}
+    _l, _s, plain = _session(w)
+    assert "follow_link" not in plain
+
+
 def test_the_landing_peek_for_a_media_link_names_the_door_and_nothing_else(w):
     w.cfg.media_base_url = "https://{tenant}-media.example.com"
     link, secret = _mint(w, "claimed")

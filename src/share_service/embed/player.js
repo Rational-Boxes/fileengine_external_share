@@ -99,7 +99,19 @@ function play(peek, s) {
   const v = el(peek.kind === 'audio' ? 'audio' : 'video', { controls: true, playsinline: true, src: src.url,
     poster: peek.poster ? `${peek.poster}?k=${encodeURIComponent(K)}` : false, autoplay: true })
   if (s.beacon) track(v, s.beacon, src.quality)
-  show(el('h1', {}, peek.title || 'Shared video'), v)
+  // The creator's sign-off link: a new tab, never this frame, and no opener or
+  // referrer handed to the destination.
+  const follow = followLink(s.follow_link)
+  show(el('h1', {}, peek.title || 'Shared video'), v, ...(follow ? [follow] : []))
+}
+
+function followLink(f) {
+  if (!f || typeof f.url !== 'string') return null
+  let u
+  try { u = new URL(f.url) } catch { return null }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return null
+  return el('p', { class: 'fp-follow' },
+    el('a', { href: u.href, target: '_blank', rel: 'noopener noreferrer' }, `${f.title || u.host} \u2197`))
 }
 
 async function session(peek, path, body, headers) {
